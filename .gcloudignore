@@ -1,0 +1,8 @@
+# Ignore everything by default
+*
+
+# Allow compiled typescript (which is javascript)
+!dist/src
+!package.json
+!package-lock.json
+!Procfile

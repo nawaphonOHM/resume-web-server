@@ -1,0 +1,64 @@
+name: DEPLOY.yml
+on:
+  push:
+    tags:
+      - 'v\d+\.\d+\.\d+'
+permissions:
+  id-token: write # Required for requesting the JWT/OIDC token
+  contents: read # Required for actions/checkout
+
+env:
+  SERVICE_ACCOUNT: ${{ secrets.SERVICE_ACCOUNT }}
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Pull Code
+        uses: actions/checkout@v7
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.PROVIDER }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Set Short SHA
+        id: SHORT_SHA
+        run: |
+          echo "SHORT_SHA=$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_ENV
+
+      - name: Replace Parameter in cloudbuild.yaml
+        env:
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          SHORT_SHA: ${{ env.SHORT_SHA }}
+          BUILDER: ${{ vars.BUILDER }}
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          LOCATION: ${{ vars.LOCATION }}
+          REPO_NAME: ${{ vars.REPO_NAME }}
+        run: |
+          sed -i "s|_IMAGE_NAME_|$IMAGE_NAME|g" cloudbuild.yaml
+          sed -i "s|_SHORT_SHA_|$SHORT_SHA|g" cloudbuild.yaml
+          sed -i "s|_BUILDER_|$BUILDER|g" cloudbuild.yaml
+          sed -i "s|_SERVICE_NAME_|$SERVICE_NAME|g" cloudbuild.yaml
+          sed -i "s|_SERVICE_ACCOUNT_|$SERVICE_ACCOUNT|g" cloudbuild.yaml
+          sed -i "s|_LOCATION_|$LOCATION|g" cloudbuild.yaml
+          sed -i "s|_REPO_NAME_|$REPO_NAME|g" cloudbuild.yaml
+
+      - name: Compile TypeScript
+        run: npm run compile
+
+      - name: Submit Cloud Build
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          REGION: ${{ vars.LOCATION }}
+          BUCKET_NAME: ${{ secrets.STAGING_BUCKET_NAME }}
+        run: |
+          gcloud builds submit . --gcs-source-staging-dir gs://$BUCKET_NAME/source --service-account projects/$PROJECT_ID/serviceAccounts/$SERVICE_ACCOUNT --region $REGION --project $PROJECT_ID
