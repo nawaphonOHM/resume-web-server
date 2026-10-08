@@ -5,6 +5,9 @@ import tseslint from 'typescript-eslint';
 
 export default defineConfig([
   {
+    ignores: ['dist/**'],
+  },
+  {
     files: ['**/*.ts', '**/*.test.ts'],
     // Enable typed linting via the typescript-eslint Project Service.
     // This is slower than untyped linting; see https://typescript-eslint.io/getting-started/typed-linting

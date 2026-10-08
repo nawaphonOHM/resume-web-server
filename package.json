@@ -1,17 +1,19 @@
 {
   "name": "resume-webserver",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "compile": "tsc",
     "check-format": "prettier --check .",
     "formatting": "prettier --write .",
     "lint": "eslint .",
-    "test": "tsx --test tests/**/*.test.ts"
+    "test": "tsx --test tests/**/*.test.ts",
+    "clean": "rm -rf dist"
   },
   "private": true,
   "dependencies": {
-    "@google-cloud/storage": "^8.3.0"
+    "@google-cloud/storage": "^8.3.0",
+    "winston": "^3.19.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
