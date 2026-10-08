@@ -1,0 +1,32 @@
+{
+  "name": "resume-webserver",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "compile": "tsc",
+    "check-format": "prettier --check .",
+    "formatting": "prettier --write .",
+    "lint": "eslint .",
+    "test": "tsx --test tests/**/*.test.ts",
+    "clean": "rm -rf dist"
+  },
+  "private": true,
+  "dependencies": {
+    "@google-cloud/storage": "^8.0.0",
+    "winston": "^3.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "eslint-plugin-import": "^2.0.0",
+    "eslint-plugin-sonarjs": "^4.0.0",
+    "eslint-plugin-unicorn": "^65.0.0",
+    "prettier": "^3.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^6.0.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}

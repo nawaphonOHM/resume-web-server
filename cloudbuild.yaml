@@ -1,0 +1,40 @@
+steps:
+  # Step 1: Build the Docker image and push to the registry
+  - name: 'docker.io/buildpacksio/pack'
+    id: 'Build Image'
+    args:
+      - 'build'
+      - '$_LOCATION-docker.pkg.dev/$PROJECT_ID/$_REPO_NAME/$_IMAGE_NAME:$_SHORT_SHA'
+      - '--builder=$_BUILDER'
+      - '--network=cloudbuild'
+      - '--publish'
+
+    # Step 2: Deploy the container image to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'Deploy to Cloud Run'
+    args:
+      - 'run'
+      - 'deploy'
+      - '$_SERVICE_NAME'
+      - '--image=$_LOCATION-docker.pkg.dev/$PROJECT_ID/$_REPO_NAME/$_IMAGE_NAME:$_SHORT_SHA'
+      - '--region=$_LOCATION'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--service-account=$_SERVICE_ACCOUNT'
+      - '--ingress=internal-and-cloud-load-balancing'
+      - '--startup-probe=httpGet.port=8080,httpGet.path=/health,timeoutSeconds=1,periodSeconds=10,failureThreshold=3'
+
+# Specify custom build execution service account
+serviceAccount: 'projects/$PROJECT_ID/serviceAccounts/$_SERVICE_ACCOUNT'
+
+substitutions:
+  _LOCATION: _LOCATION_
+  _REPO_NAME: _REPO_NAME_
+  _IMAGE_NAME: _IMAGE_NAME_
+  _SHORT_SHA: _SHORT_SHA_
+  _BUILDER: _BUILDER_
+  _SERVICE_NAME: _SERVICE_NAME_
+  _SERVICE_ACCOUNT: _SERVICE_ACCOUNT_
+
+options:
+  logging: CLOUD_LOGGING_ONLY
