@@ -23,6 +23,10 @@ import {
 } from '../src/logger.ts';
 import type { StorageService } from '../src/storage.ts';
 
+// Ensure process.env has baseline mock values for server startup in tests
+process.env['GCS_BUCKET_NAME'] = 'test-bucket';
+process.env['GCS_PREFIX'] = 'test-prefix';
+
 /**
  * Custom memory writable stream to capture formatted log output in tests.
  */
@@ -1059,9 +1063,9 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
     async function runCliProcess(
       scriptPath = 'src/index.ts',
       args: string[] = [],
-      envOverrides: Record<string, string> = {},
+      envOverrides: Record<string, string | undefined> = {},
       timeoutMs = 10000,
-    ): Promise<{ exitCode: number | null; output: string }> {
+    ): Promise<{ exitCode: number | null; output: string; stdout: string; stderr: string }> {
       const { spawn } = await import('node:child_process');
       const { promises: fs } = await import('node:fs');
       const os = await import('node:os');
@@ -1069,20 +1073,28 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
       const { fileURLToPath } = await import('node:url');
 
       const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-      const tempOutputFile = path.join(
+      const tempOutFile = path.join(
         os.tmpdir(),
-        `test-cli-flush-${String(Date.now())}-${String(Math.random()).slice(2)}.txt`,
+        `test-cli-out-${String(Date.now())}-${String(Math.random()).slice(2)}.txt`,
       );
-      const outFd = await fs.open(tempOutputFile, 'w');
+      const tempErrFile = path.join(
+        os.tmpdir(),
+        `test-cli-err-${String(Date.now())}-${String(Math.random()).slice(2)}.txt`,
+      );
+      const outFd = await fs.open(tempOutFile, 'w');
+      const errFd = await fs.open(tempErrFile, 'w');
+
+      const effectiveEnv = Object.fromEntries(
+        Object.entries({ ...process.env, ...envOverrides }).filter(
+          (entry): entry is [string, string] => entry[1] !== undefined,
+        ),
+      );
 
       try {
         const child = spawn(process.execPath, ['--import', 'tsx', scriptPath, ...args], {
           cwd: projectRoot,
-          env: {
-            ...process.env,
-            ...envOverrides,
-          },
-          stdio: ['ignore', outFd.fd, outFd.fd],
+          env: effectiveEnv,
+          stdio: ['ignore', outFd.fd, errFd.fd],
         });
 
         const exitCode = await new Promise<number | null>((resolve, reject) => {
@@ -1103,8 +1115,11 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
         });
 
         await outFd.close();
-        const output = await fs.readFile(tempOutputFile, 'utf-8');
-        return { exitCode, output };
+        await errFd.close();
+        const stdout = await fs.readFile(tempOutFile, 'utf-8');
+        const stderr = await fs.readFile(tempErrFile, 'utf-8');
+        const output = stdout + stderr;
+        return { exitCode, output, stdout, stderr };
       } finally {
         try {
           await outFd.close();
@@ -1112,12 +1127,45 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
           /* ignore */
         }
         try {
-          await fs.unlink(tempOutputFile);
+          await errFd.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          await fs.unlink(tempOutFile);
+        } catch {
+          /* ignore */
+        }
+        try {
+          await fs.unlink(tempErrFile);
         } catch {
           /* ignore */
         }
       }
     }
+
+    void it(
+      'should exit with code 1 and log missing required environment variables to stderr when run via CLI without GCS env',
+      { timeout: 15000 },
+      async () => {
+        const { exitCode, stderr, output } = await runCliProcess('src/index.ts', [], {
+          GCS_BUCKET_NAME: undefined,
+          GCS_PREFIX: undefined,
+        });
+
+        assert.equal(exitCode, 1);
+        assert.ok(
+          stderr.includes('Missing required environment variable(s): GCS_BUCKET_NAME, GCS_PREFIX'),
+          `Expected missing variable error message on stderr, got stderr: ${stderr}`,
+        );
+        assert.ok(
+          stderr.includes('Please set GCS_BUCKET_NAME and GCS_PREFIX before running the server.'),
+        );
+        assert.ok(
+          output.includes('Missing required environment variable(s): GCS_BUCKET_NAME, GCS_PREFIX'),
+        );
+      },
+    );
 
     void it(
       'should flush fatal error logs to redirected file before process termination',
@@ -1135,6 +1183,8 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
           const { exitCode, output } = await runCliProcess('src/index.ts', [], {
             PORT: String(holderPort),
             HOST: '127.0.0.1',
+            GCS_BUCKET_NAME: 'test-bucket',
+            GCS_PREFIX: 'test-prefix',
           });
 
           assert.equal(exitCode, 1);

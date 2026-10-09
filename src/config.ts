@@ -2,14 +2,14 @@
  * Server Configuration Module.
  *
  * Provides environment variable parsing, default configuration values,
- * network port range validation, and object storage prefix normalization
- * for the web server application following SOLID principles.
+ * network port range validation, object storage prefix normalization,
+ * and mandatory environment variable enforcement for the web server application
+ * following SOLID principles.
  *
  * @remarks
- * Configuration values are resolved with precedence given to environment variables
- * (`PORT`, `HOST`, `GCS_BUCKET_NAME`, `GCS_PREFIX`), falling back to sensible
- * production defaults when variables are absent or invalid (note that a set-but-empty
- * `GCS_PREFIX` normalizes to the bucket root `''` rather than the default).
+ * Configuration values are resolved from environment variables (`PORT`, `HOST`,
+ * `GCS_BUCKET_NAME`, `GCS_PREFIX`). `PORT` and `HOST` fall back to sensible defaults
+ * (`8080` and `'0.0.0.0'`), while `GCS_BUCKET_NAME` and `GCS_PREFIX` are required.
  *
  * @packageDocumentation
  */
@@ -41,7 +41,9 @@ export interface ServerConfig {
   /**
    * The Google Cloud Storage (GCS) bucket name containing the static assets.
    *
-   * @defaultValue `'resume_cloudbuild'`
+   * @remarks
+   * Required parameter resolved from the `GCS_BUCKET_NAME` environment variable.
+   * Cannot be empty or whitespace-only.
    */
   readonly bucketName: string;
 
@@ -49,11 +51,9 @@ export interface ServerConfig {
    * The object key prefix (subfolder) within the GCS bucket where assets are located.
    *
    * @remarks
+   * Required parameter resolved from the `GCS_PREFIX` environment variable.
    * Leading and trailing forward slashes are stripped during normalization.
-   * When `GCS_PREFIX` is set to an empty string, whitespace only, or slashes only,
-   * it normalizes to the bucket root (`''`) rather than the default fallback.
-   *
-   * @defaultValue `'resume_cloudbuild/angular'`
+   * Cannot be empty, whitespace-only, or slash-only.
    */
   readonly prefix: string;
 }
@@ -81,13 +81,12 @@ export interface IConfigValidator {
   normalizeString(rawValue: string | undefined, defaultValue: string): string;
 
   /**
-   * Normalizes a GCS object key prefix by trimming slashes.
+   * Normalizes a GCS object key prefix by trimming whitespace and leading/trailing forward slashes.
    *
    * @param rawPrefix - The raw prefix string from environment.
-   * @param defaultPrefix - Fallback prefix when unset.
    * @returns Normalized prefix string.
    */
-  normalizePrefix(rawPrefix: string | undefined, defaultPrefix: string): string;
+  normalizePrefix(rawPrefix: string): string;
 }
 
 /**
@@ -112,16 +111,6 @@ export const DEFAULT_PORT = 8080;
  * Default network host interface used when `HOST` is omitted or empty.
  */
 export const DEFAULT_HOST = '0.0.0.0';
-
-/**
- * Default Google Cloud Storage bucket name used when `GCS_BUCKET_NAME` is omitted or empty.
- */
-export const DEFAULT_BUCKET_NAME = 'resume_cloudbuild';
-
-/**
- * Default GCS object key prefix used only when `GCS_PREFIX` is unset; empty, whitespace-only, or slash-only values normalize to the bucket root (`''`).
- */
-export const DEFAULT_PREFIX = 'resume_cloudbuild/angular';
 
 /**
  * Default validator implementation for server configuration parameters.
@@ -156,15 +145,13 @@ export class DefaultConfigValidator implements IConfigValidator {
   }
 
   /**
-   * Normalizes a GCS storage prefix.
+   * Normalizes a GCS storage prefix by trimming whitespace and leading/trailing forward slashes.
    *
    * @param rawPrefix - The raw prefix string.
-   * @param defaultPrefix - Fallback prefix.
    * @returns Normalized prefix.
    */
-  public normalizePrefix(rawPrefix: string | undefined, defaultPrefix: string): string {
-    const prefixInput = rawPrefix !== undefined ? rawPrefix.trim() : defaultPrefix;
-    return prefixInput.replace(/^\/+|\/+$/g, '');
+  public normalizePrefix(rawPrefix: string): string {
+    return rawPrefix.trim().replace(/^\/+|\/+$/g, '');
   }
 }
 
@@ -183,7 +170,22 @@ export interface EnvConfigLoaderOptions {
    * Optional application logger for recording configuration resolution decisions.
    */
   readonly logger?: AppLogger;
+
+  /**
+   * Optional process exit handler for dependency injection and testing.
+   *
+   * @defaultValue `(code, msg) => { console.error(msg); process.exit(code); }`
+   */
+  readonly exitFn?: (code: number, message: string) => void;
 }
+
+/**
+ * Default process exit handler that writes the error message to stderr and terminates the Node.js process.
+ */
+const defaultExitFn = (code: number, message: string): void => {
+  console.error(message);
+  process.exit(code);
+};
 
 /**
  * Environment-variable backed configuration loader (Single Responsibility & Dependency Inversion).
@@ -200,21 +202,30 @@ export class EnvConfigLoader implements IConfigLoader {
   private readonly logger?: AppLogger;
 
   /**
+   * Process exit handler.
+   */
+  private readonly exitFn: (code: number, message: string) => void;
+
+  /**
    * Creates a new `EnvConfigLoader` instance.
    *
    * @param validatorOrOptions - Injected validator implementing {@link IConfigValidator} or {@link EnvConfigLoaderOptions}. Defaults to {@link DefaultConfigValidator}.
    * @param logger - Optional injected {@link AppLogger}.
+   * @param exitFn - Optional injected process exit handler.
    */
   public constructor(
     validatorOrOptions?: IConfigValidator | EnvConfigLoaderOptions,
     logger?: AppLogger,
+    exitFn?: (code: number, message: string) => void,
   ) {
     if (validatorOrOptions && 'validatePort' in validatorOrOptions) {
       this.validator = validatorOrOptions;
       this.logger = logger;
+      this.exitFn = exitFn ?? defaultExitFn;
     } else {
       this.validator = validatorOrOptions?.validator ?? new DefaultConfigValidator();
       this.logger = validatorOrOptions?.logger ?? logger;
+      this.exitFn = validatorOrOptions?.exitFn ?? exitFn ?? defaultExitFn;
     }
   }
 
@@ -225,6 +236,29 @@ export class EnvConfigLoader implements IConfigLoader {
    * @returns The resolved {@link ServerConfig}.
    */
   public load(env: NodeJS.ProcessEnv = process.env): ServerConfig {
+    const rawBucket = env['GCS_BUCKET_NAME'];
+    const bucketName = this.validator.normalizeString(rawBucket, '');
+
+    const rawPrefix = env['GCS_PREFIX'];
+    const prefix = rawPrefix !== undefined ? this.validator.normalizePrefix(rawPrefix) : '';
+
+    const missingVars: string[] = [];
+    if (bucketName === '') {
+      missingVars.push('GCS_BUCKET_NAME');
+    }
+    if (prefix === '') {
+      missingVars.push('GCS_PREFIX');
+    }
+
+    if (missingVars.length > 0) {
+      const errorMessage = `Missing required environment variable(s): ${missingVars.join(', ')}. Please set ${missingVars.join(' and ')} before running the server.`;
+      if (this.logger) {
+        this.logger.error(errorMessage);
+      }
+      this.exitFn(1, errorMessage);
+      throw new Error(errorMessage);
+    }
+
     const rawPort = env['PORT'];
     const port = this.validator.validatePort(rawPort, DEFAULT_PORT);
     if (this.logger) {
@@ -283,53 +317,22 @@ export class EnvConfigLoader implements IConfigLoader {
       });
     }
 
-    const rawBucket = env['GCS_BUCKET_NAME'];
-    const bucketName = this.validator.normalizeString(rawBucket, DEFAULT_BUCKET_NAME);
     if (this.logger) {
-      const choice = `bucketName: '${bucketName}'`;
-      let reason: string;
-      if (rawBucket === undefined) {
-        reason =
-          bucketName === DEFAULT_BUCKET_NAME
-            ? `GCS_BUCKET_NAME environment variable not set, falling back to DEFAULT_BUCKET_NAME ('${DEFAULT_BUCKET_NAME}')`
-            : `GCS_BUCKET_NAME environment variable not set, resolved to '${bucketName}' via validator`;
-      } else if (rawBucket.trim() === '') {
-        reason =
-          bucketName === DEFAULT_BUCKET_NAME
-            ? `GCS_BUCKET_NAME environment variable is empty, falling back to DEFAULT_BUCKET_NAME ('${DEFAULT_BUCKET_NAME}')`
-            : `GCS_BUCKET_NAME environment variable is empty, resolved to '${bucketName}' via validator`;
-      } else {
-        reason = `Resolved from GCS_BUCKET_NAME environment variable`;
-      }
       this.logger.decision({
         action: 'Config',
-        choice,
-        reason,
+        choice: `bucketName: '${bucketName}'`,
+        reason: 'Resolved from GCS_BUCKET_NAME environment variable',
         level: 'debug',
         variable: 'GCS_BUCKET_NAME',
         resolved: bucketName,
       });
     }
 
-    const rawPrefix = env['GCS_PREFIX'];
-    const prefix = this.validator.normalizePrefix(rawPrefix, DEFAULT_PREFIX);
     if (this.logger) {
-      const choice = `prefix: '${prefix}'`;
-      let reason: string;
-      if (rawPrefix === undefined) {
-        reason =
-          prefix === DEFAULT_PREFIX
-            ? `GCS_PREFIX environment variable not set, falling back to DEFAULT_PREFIX ('${DEFAULT_PREFIX}')`
-            : `GCS_PREFIX environment variable not set, resolved to '${prefix}' via validator`;
-      } else if (prefix === '') {
-        reason = `GCS_PREFIX environment variable is empty or root-only, normalized to bucket root ('')`;
-      } else {
-        reason = `Resolved from GCS_PREFIX environment variable and normalized`;
-      }
       this.logger.decision({
         action: 'Config',
-        choice,
-        reason,
+        choice: `prefix: '${prefix}'`,
+        reason: 'Resolved from GCS_PREFIX environment variable and normalized',
         level: 'debug',
         variable: 'GCS_PREFIX',
         resolved: prefix,
@@ -346,9 +349,13 @@ export class EnvConfigLoader implements IConfigLoader {
 }
 
 /**
- * Default singleton configuration loader instance.
+ * Type guard to determine if a value is an {@link AppLogger}.
  */
-const defaultConfigLoader: IConfigLoader = new EnvConfigLoader();
+function isAppLogger(
+  loggerOrOptions: AppLogger | EnvConfigLoaderOptions,
+): loggerOrOptions is AppLogger {
+  return 'info' in loggerOrOptions && typeof loggerOrOptions.info === 'function';
+}
 
 /**
  * Loads and validates the server configuration from the provided environment map.
@@ -358,19 +365,17 @@ const defaultConfigLoader: IConfigLoader = new EnvConfigLoader();
  * - `PORT`: Trimmed and parsed as a base-10 integer. Must be between 1 and 65535 (inclusive);
  *   otherwise falls back to {@link DEFAULT_PORT}.
  * - `HOST`: Trimmed string; falls back to {@link DEFAULT_HOST} if empty or unset.
- * - `GCS_BUCKET_NAME`: Trimmed string; falls back to {@link DEFAULT_BUCKET_NAME} if empty or unset.
- * - `GCS_PREFIX`: Trimmed string; normalized by removing leading and trailing slashes (`/`).
- *   Falls back to {@link DEFAULT_PREFIX} only when unset; empty, whitespace-only, or slash-only values normalize to the bucket root (`''`).
+ * - `GCS_BUCKET_NAME`: Required non-empty string; missing or whitespace-only values cause exit code 1.
+ * - `GCS_PREFIX`: Required non-empty string normalized by removing leading and trailing slashes (`/`);
+ *   missing, whitespace-only, or slash-only values cause exit code 1.
  *
  * @param env - Environment variable key-value map. Defaults to `process.env`.
- * @param logger - Optional {@link AppLogger} for recording decision telemetry.
+ * @param loggerOrOptions - Optional {@link AppLogger} or {@link EnvConfigLoaderOptions}.
+ * @param options - Optional {@link EnvConfigLoaderOptions} when logger is supplied as second argument.
  * @returns The validated and normalized {@link ServerConfig} object.
  *
  * @example
  * ```ts
- * // Load configuration from default process.env
- * const config = loadConfig();
- *
  * // Load configuration with custom overrides
  * const customConfig = loadConfig({
  *   PORT: '3000',
@@ -381,14 +386,113 @@ const defaultConfigLoader: IConfigLoader = new EnvConfigLoader();
  * console.log(customConfig.prefix); // 'assets'
  * ```
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env, logger?: AppLogger): ServerConfig {
-  if (logger) {
-    return new EnvConfigLoader({ logger }).load(env);
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  loggerOrOptions?: AppLogger | EnvConfigLoaderOptions,
+  options?: EnvConfigLoaderOptions,
+): ServerConfig {
+  let loaderOptions: EnvConfigLoaderOptions = {};
+  if (loggerOrOptions) {
+    if (isAppLogger(loggerOrOptions)) {
+      loaderOptions = { logger: loggerOrOptions, ...options };
+    } else {
+      loaderOptions = loggerOrOptions;
+    }
+  } else if (options) {
+    loaderOptions = options;
   }
-  return defaultConfigLoader.load(env);
+  return new EnvConfigLoader(loaderOptions).load(env);
 }
 
 /**
- * Default singleton server configuration loaded from the runtime `process.env`.
+ * Mutable backing target object for the lazily-initialized default {@link ServerConfig} singleton.
  */
-export const config: ServerConfig = loadConfig();
+const targetConfig: ServerConfig = {} as ServerConfig;
+let isConfigInitialized = false;
+
+/**
+ * Node.js custom inspection symbol for formatted debugging output.
+ */
+const customInspectSymbol = Symbol.for('nodejs.util.inspect.custom');
+
+/**
+ * Ensures that the backing configuration target is initialized with a snapshot from `process.env`.
+ */
+function ensureConfigInitialized(): ServerConfig {
+  if (!isConfigInitialized) {
+    const loaded = loadConfig(process.env);
+    Object.assign(targetConfig, loaded);
+    isConfigInitialized = true;
+  }
+  return targetConfig;
+}
+
+Object.defineProperty(targetConfig, customInspectSymbol, {
+  value: function (): Record<string, unknown> {
+    ensureConfigInitialized();
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(targetConfig)) {
+      result[key] = (targetConfig as unknown as Record<string, unknown>)[key];
+    }
+    return result;
+  },
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+/**
+ * Default singleton server configuration loaded lazily from the runtime `process.env`.
+ *
+ * @remarks
+ * Uses a reflective Proxy backed by a mutable target object that is populated on first access.
+ * This preserves standard JavaScript object invariants (`Object.freeze`, `Object.keys`, `util.inspect`,
+ * property descriptors, setters, deleters, etc.) while deferring configuration loading and validation
+ * until actual property access.
+ */
+export const config: ServerConfig = new Proxy(targetConfig, {
+  get(target, prop, receiver) {
+    ensureConfigInitialized();
+    return Reflect.get(target, prop, receiver) as unknown;
+  },
+  set(target, prop, value, receiver) {
+    ensureConfigInitialized();
+    return Reflect.set(target, prop, value, receiver);
+  },
+  has(target, prop) {
+    ensureConfigInitialized();
+    return Reflect.has(target, prop);
+  },
+  deleteProperty(target, prop) {
+    ensureConfigInitialized();
+    return Reflect.deleteProperty(target, prop);
+  },
+  ownKeys(target) {
+    ensureConfigInitialized();
+    return Reflect.ownKeys(target);
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    ensureConfigInitialized();
+    return Reflect.getOwnPropertyDescriptor(target, prop);
+  },
+  defineProperty(target, prop, attributes) {
+    ensureConfigInitialized();
+    return Reflect.defineProperty(target, prop, attributes);
+  },
+  preventExtensions(target) {
+    ensureConfigInitialized();
+    return Reflect.preventExtensions(target);
+  },
+  isExtensible(target) {
+    ensureConfigInitialized();
+    return Reflect.isExtensible(target);
+  },
+  getPrototypeOf(target) {
+    ensureConfigInitialized();
+    return Reflect.getPrototypeOf(target);
+  },
+  setPrototypeOf(target, proto) {
+    ensureConfigInitialized();
+    return Reflect.setPrototypeOf(target, proto);
+  },
+});
