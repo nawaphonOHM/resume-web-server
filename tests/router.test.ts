@@ -1359,6 +1359,11 @@ void describe('HTTP Router & Request Handler', () => {
 
       // Router DI constructor
       const routerWithDeps = new Router({
+        storageService: new GcsStorageService({
+          config: testConfig,
+          storageClient: createMockStorage([]),
+          logger: silentLogger,
+        }),
         pathSanitizer: sanitizer,
         securityHeadersPolicy: policy,
         httpMethodValidator: validator,
