@@ -679,7 +679,7 @@ const IGNORED_CONSOLE_KEYS = new Set([
   'additionalErrors',
 ]);
 
-// eslint-disable-next-line no-control-regex -- control character range required to sanitize hostile log injection and ANSI terminal exploits
+
 const CONTROL_CHAR_REGEX = /[\x00-\x1f\x7f\u2028\u2029]/g;
 
 /**

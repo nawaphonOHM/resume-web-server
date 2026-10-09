@@ -15,7 +15,7 @@ switch (mode) {
     break;
   case 'uncaught-string':
     setImmediate(() => {
-      // eslint-disable-next-line @typescript-eslint/only-throw-error -- intentional test for string throw formatting
+
       throw 'Simulated uncaught string error';
     });
     break;
@@ -26,7 +26,7 @@ switch (mode) {
     break;
   case 'unhandled-object':
     setImmediate(() => {
-      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- simulated non-Error rejection containing sensitive fields
+
       void Promise.reject({
         status: 500,
         detail: 'Plain object rejection reason',
@@ -37,7 +37,7 @@ switch (mode) {
     break;
   case 'unhandled-string':
     setImmediate(() => {
-      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- simulated primitive string rejection
+
       void Promise.reject('Plain string rejection reason');
     });
     break;
