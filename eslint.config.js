@@ -7,7 +7,6 @@ import tsPlugin from '@typescript-eslint/eslint-plugin';
 import importPlugin from 'eslint-plugin-import';
 import sonarjs from 'eslint-plugin-sonarjs';
 import unicorn from 'eslint-plugin-unicorn';
-import spellcheck from 'eslint-plugin-spellcheck';
 
 export default defineConfig([
   {
@@ -24,7 +23,6 @@ export default defineConfig([
       import: importPlugin,
       sonarjs: sonarjs,
       unicorn: unicorn,
-      spellcheck: spellcheck,
     },
     extends: [
       eslint.configs.recommended,
