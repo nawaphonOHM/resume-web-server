@@ -10,11 +10,13 @@ import { logger as defaultLogger, type AppLogger } from '../logger/logger.ts';
 import { RFC9110EtagFormatter } from '../etag_formatter.ts';
 import { GcsErrorClassifier } from './storage_error_classifier.ts';
 import { mergeDeps, type RawStorageDeps, type RestStorageDeps } from './storage_deps_merge.ts';
+import { StorageObjectLocator } from './storage_object_locator.ts';
 import { StoragePathResolver } from './storage_path_resolver.ts';
 import type {
   IEtagFormatter,
   IStorageErrorClassifier,
   IStorageKeyResolver,
+  IStorageObjectLocator,
   StorageServiceOptions,
 } from './storage_types.ts';
 
@@ -26,11 +28,14 @@ export interface ResolvedStorageDeps {
   readonly pathResolver: IStorageKeyResolver;
   readonly etagFormatter: IEtagFormatter;
   readonly errorClassifier: IStorageErrorClassifier;
+  readonly objectLocator: IStorageObjectLocator;
   readonly logger: AppLogger;
 }
 
+const STORAGE_OPTION_KEYS = ['storageClient', 'pathResolver', 'etagFormatter', 'locator'];
+
 function hasStorageField(obj: Record<string, unknown>): boolean {
-  return 'storageClient' in obj || 'pathResolver' in obj || 'etagFormatter' in obj;
+  return STORAGE_OPTION_KEYS.some((key) => key in obj);
 }
 
 function hasConfigObject(obj: Record<string, unknown>): boolean {
@@ -77,13 +82,22 @@ function getErr(cls?: IStorageErrorClassifier): IStorageErrorClassifier {
   return cls ?? new GcsErrorClassifier();
 }
 
+function getLocator(
+  loc?: IStorageObjectLocator,
+  cls?: IStorageErrorClassifier,
+  log?: AppLogger,
+): IStorageObjectLocator {
+  return loc ?? new StorageObjectLocator(cls, log);
+}
+
 function buildResolvedDeps(config: ServerConfig, raw: RawStorageDeps): ResolvedStorageDeps {
   const logger = getLogger(raw.logger);
   const pathResolver = getPath(config.prefix, raw.pathResolver, logger);
   const storage = getStorage(raw.storageClient);
   const etagFormatter = getEtag(raw.etagFormatter);
   const errorClassifier = getErr(raw.errorClassifier);
-  return { config, storage, pathResolver, etagFormatter, errorClassifier, logger };
+  const objectLocator = getLocator(raw.locator, errorClassifier, logger);
+  return { config, storage, pathResolver, etagFormatter, errorClassifier, objectLocator, logger };
 }
 
 export function resolveStorageDeps(

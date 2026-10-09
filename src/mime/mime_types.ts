@@ -43,6 +43,23 @@ export const MIME_TYPES: Readonly<Record<string, string>> = Object.freeze({
 export const DEFAULT_MIME_TYPE = 'application/octet-stream';
 
 /**
+ * Set of HTML file extensions that are treated as SPA entry points / navigation routes rather than static assets.
+ */
+export const KNOWN_HTML_EXTENSIONS: ReadonlySet<string> = new Set(['.html', '.htm']);
+
+/**
+ * Set of recognized static asset extensions (all extensions in {@link MIME_TYPES} excluding HTML documents).
+ */
+export const KNOWN_STATIC_EXTENSIONS: ReadonlySet<string> = new Set(
+  Object.keys(MIME_TYPES).filter((ext) => !KNOWN_HTML_EXTENSIONS.has(ext)),
+);
+
+/**
+ * Set of all allowed file extensions defined in {@link MIME_TYPES}.
+ */
+export const ALLOWED_STATIC_EXTENSIONS: ReadonlySet<string> = new Set(Object.keys(MIME_TYPES));
+
+/**
  * Cache-Control header directive for immutable, content-hashed static assets.
  *
  * @remarks

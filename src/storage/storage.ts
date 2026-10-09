@@ -23,6 +23,9 @@ export {
   type IStorageStreamer,
   type IEtagFormatter,
   type IStorageErrorClassifier,
+  type IStorageObjectLocator,
+  type LocateResult,
+  type CandidateFileMatch,
   type StorageService,
   type StorageServiceOptions,
 } from './storage_types.ts';
@@ -34,4 +37,14 @@ export {
   isNotFoundError,
 } from './storage_error_classifier.ts';
 export { StoragePathResolver } from './storage_path_resolver.ts';
+export {
+  StorageObjectLocator,
+  parseTimestampFromDirectory,
+  computeDirectPath,
+  formatSearchPrefix,
+  collectFilesUnderPrefix,
+  extractCandidateMatch,
+  compareCandidates,
+} from './storage_object_locator.ts';
+export { resolveStorageDeps, type ResolvedStorageDeps } from './storage_deps_resolver.ts';
 export { GcsStorageService, createStorageService } from '../gcs_storage_service.ts';
