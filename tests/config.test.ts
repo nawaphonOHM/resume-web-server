@@ -7,8 +7,8 @@ import {
   EnvConfigLoader,
   DEFAULT_PORT,
   DEFAULT_HOST,
-} from '../src/config.ts';
-import type { AppLogger, DecisionLogPayload } from '../src/logger.ts';
+} from '../src/config/config.ts';
+import type { AppLogger, DecisionLogPayload } from '../src/logger/logger.ts';
 
 // Ensure process.env has baseline mock values so the singleton config proxy can initialize safely
 process.env['GCS_BUCKET_NAME'] = 'test-bucket';

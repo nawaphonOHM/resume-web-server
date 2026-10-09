@@ -12,8 +12,8 @@ import {
   DefaultAssetClassifier,
   DefaultCachePolicyResolver,
   type IAssetClassifier,
-} from '../src/mime.ts';
-import type { AppLogger, DecisionLogPayload } from '../src/logger.ts';
+} from '../src/mime/mime.ts';
+import type { AppLogger, DecisionLogPayload } from '../src/logger/logger.ts';
 
 /**
  * Creates a mock {@link AppLogger} that captures emitted decisions and log messages.

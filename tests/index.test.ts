@@ -1,7 +1,9 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { Socket } from 'node:net';
 import { Writable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import winston from 'winston';
 import {
   startServer,
@@ -20,8 +22,12 @@ import {
   type AppLogger,
   type DecisionLogPayload,
   type LogLevel,
-} from '../src/logger.ts';
-import type { StorageService } from '../src/storage.ts';
+} from '../src/logger/logger.ts';
+import type { StorageService } from '../src/storage/storage.ts';
+import {
+  attachResponseSocketDrainer,
+  createShutdownRequestInterceptor,
+} from '../src/shutdown/shutdown_interceptor.ts';
 
 // Ensure process.env has baseline mock values for server startup in tests
 process.env['GCS_BUCKET_NAME'] = 'test-bucket';
@@ -1206,7 +1212,7 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
       'should handle CLI uncaughtException with Error instance, format Java-style error, flush, and exit 1',
       { timeout: 15000 },
       async () => {
-        const { exitCode, output } = await runCliProcess('tests/fixtures/cli-fatal.ts', [
+        const { exitCode, output } = await runCliProcess('tests/fixtures/cli_fatal.ts', [
           'uncaught-error',
         ]);
 
@@ -1222,7 +1228,7 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
       'should handle CLI uncaughtException with primitive string, format Java-style error, flush, and exit 1',
       { timeout: 15000 },
       async () => {
-        const { exitCode, output } = await runCliProcess('tests/fixtures/cli-fatal.ts', [
+        const { exitCode, output } = await runCliProcess('tests/fixtures/cli_fatal.ts', [
           'uncaught-string',
         ]);
 
@@ -1238,7 +1244,7 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
       'should handle CLI unhandledRejection with Error instance, format Java-style error, flush, and exit 1',
       { timeout: 15000 },
       async () => {
-        const { exitCode, output } = await runCliProcess('tests/fixtures/cli-fatal.ts', [
+        const { exitCode, output } = await runCliProcess('tests/fixtures/cli_fatal.ts', [
           'unhandled-error',
         ]);
 
@@ -1254,7 +1260,7 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
       'should handle CLI unhandledRejection with non-Error plain object, sanitize secrets, format Java-style error, flush, and exit 1',
       { timeout: 15000 },
       async () => {
-        const { exitCode, output } = await runCliProcess('tests/fixtures/cli-fatal.ts', [
+        const { exitCode, output } = await runCliProcess('tests/fixtures/cli_fatal.ts', [
           'unhandled-object',
         ]);
 
@@ -1287,7 +1293,7 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
       'should handle CLI unhandledRejection with primitive string, format Java-style error, flush, and exit 1',
       { timeout: 15000 },
       async () => {
-        const { exitCode, output } = await runCliProcess('tests/fixtures/cli-fatal.ts', [
+        const { exitCode, output } = await runCliProcess('tests/fixtures/cli_fatal.ts', [
           'unhandled-string',
         ]);
 
@@ -1298,5 +1304,83 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
         assert.ok(output.includes('Plain string rejection reason'));
       },
     );
+  });
+
+  /**
+   * Regression tests for shutdown socket draining, signal telemetry payloads and `isMainModule` defaults.
+   */
+  void describe('Lifecycle regressions', () => {
+    void it('should end the socket captured at attach time after Node detaches res.socket', () => {
+      const socket = new Socket();
+      const res = new http.ServerResponse(new http.IncomingMessage(socket));
+      res.assignSocket(socket);
+      const end = mock.method(socket, 'end', () => socket);
+      attachResponseSocketDrainer(res);
+      res.detachSocket(socket);
+      assert.equal(res.socket, null);
+      res.emit('finish');
+      assert.equal(end.mock.callCount(), 1);
+    });
+
+    void it('should destroy the captured socket when the response closes before ending', () => {
+      const socket = new Socket();
+      const res = new http.ServerResponse(new http.IncomingMessage(socket));
+      res.assignSocket(socket);
+      const destroy = mock.method(socket, 'destroy', () => socket);
+      attachResponseSocketDrainer(res);
+      res.detachSocket(socket);
+      res.emit('close');
+      assert.equal(destroy.mock.callCount(), 1);
+    });
+
+    void it('should capture req.socket when the shutdown interceptor handles a request', () => {
+      const socket = new Socket();
+      const req = new http.IncomingMessage(socket);
+      const res = new http.ServerResponse(req);
+      res.assignSocket(socket);
+      const end = mock.method(socket, 'end', () => socket);
+      createShutdownRequestInterceptor()(req, res);
+      res.detachSocket(socket);
+      res.emit('finish');
+      assert.equal(res.getHeader('Connection'), 'close');
+      assert.equal(end.mock.callCount(), 1);
+    });
+
+    void it('should log ProcessSignal decision with only signal, timeoutMs and exitProcess extras', () => {
+      const manager = { shutdown: () => Promise.resolve(), isShuttingDown: () => false };
+      const server = http.createServer();
+      const instance: ServerInstance = {
+        server,
+        port: 8080,
+        host: '127.0.0.1',
+        config: { port: 8080, host: '127.0.0.1', bucketName: 'b', prefix: 'p' },
+        close: () => Promise.resolve(),
+        sockets: new Set(),
+      };
+      const { logger, decisions } = createDecisionSpyLogger();
+      const unbind = new SignalHandlerRegistry(manager).register(instance, {
+        exitProcess: false,
+        shutdownTimeoutMs: 1234,
+        logger,
+      });
+      try {
+        process.emit('SIGTERM');
+        const payload = decisions.find((d) => d.action === 'ProcessSignal');
+        assert.ok(payload);
+        const extras = Object.keys(payload)
+          .filter((k) => !['action', 'choice', 'reason', 'level'].includes(k))
+          .sort();
+        assert.deepEqual(extras, ['exitProcess', 'signal', 'timeoutMs']);
+        assert.equal(payload['timeoutMs'], 1234);
+      } finally {
+        unbind();
+      }
+    });
+
+    void it('should default isMainModule() to the index.ts module URL', () => {
+      const indexPath = fileURLToPath(new URL('../src/index.ts', import.meta.url));
+      assert.equal(isMainModule(undefined, indexPath), true);
+      assert.equal(isMainModule(), false);
+    });
   });
 });

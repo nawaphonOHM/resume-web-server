@@ -16,10 +16,10 @@ import {
   SystemHealthStatusProvider,
   DefaultHealthCheckHandler,
   type HealthPayload,
-} from '../src/router.ts';
-import { GcsStorageService, type StorageService } from '../src/storage.ts';
-import type { ServerConfig } from '../src/config.ts';
-import { createAppLogger, type AppLogger, type DecisionLogPayload } from '../src/logger.ts';
+} from '../src/router/router.ts';
+import { GcsStorageService, type StorageService } from '../src/storage/storage.ts';
+import type { ServerConfig } from '../src/config/config.ts';
+import { createAppLogger, type AppLogger, type DecisionLogPayload } from '../src/logger/logger.ts';
 import winston from 'winston';
 
 const silentLogger = createAppLogger({ silent: true });
@@ -1984,7 +1984,6 @@ void describe('HTTP Router & Request Handler', () => {
       const customThrowable = { code: 503, reason: 'GCS backend timeout' };
 
       const failingStorage: StorageService = {
-
         streamFile: () => Promise.reject(customThrowable),
         fileExists: () => Promise.resolve(true),
         resolveObjectName: (n) => n,
@@ -2013,6 +2012,125 @@ void describe('HTTP Router & Request Handler', () => {
       const errorLog = logs.find((l) => l.level === 'error');
       assert.ok(errorLog);
       assert.equal(errorLog.meta[0], customThrowable);
+    });
+
+    void it('should emit exact decision key order for static asset, SPA fallback, method reject, and path reject', async () => {
+      const { logger, decisions } = createCapturingLogger();
+      const mockStorage: StorageService = {
+        streamFile: () => Promise.resolve(),
+        fileExists: () => Promise.resolve(true),
+        resolveObjectName: (n) => n,
+      };
+
+      const router = new Router(mockStorage, { logger });
+
+      const createFakeRes = () =>
+        ({
+          headersSent: false,
+          destroyed: false,
+          writableEnded: false,
+          statusCode: 200,
+          setHeader() {},
+          end() {},
+        }) as unknown as ServerResponse;
+
+      // 1. Static asset
+      await router.handle(
+        { method: 'GET', url: '/styles.css' } as IncomingMessage,
+        createFakeRes(),
+      );
+      const staticDec = decisions.find(
+        (d) => d.action === 'Router' && d.choice.startsWith('stream static asset'),
+      );
+      assert.ok(staticDec);
+      assert.deepEqual(Object.keys(staticDec), [
+        'action',
+        'choice',
+        'reason',
+        'level',
+        'path',
+        'contentType',
+        'isHashed',
+        'cacheControl',
+        'isHead',
+      ]);
+
+      // 2. SPA fallback
+      await router.handle({ method: 'GET', url: '/dashboard' } as IncomingMessage, createFakeRes());
+      const spaDec = decisions.find(
+        (d) => d.action === 'Router' && d.choice === 'SPA fallback (index.html)',
+      );
+      assert.ok(spaDec);
+      assert.deepEqual(Object.keys(spaDec), [
+        'action',
+        'choice',
+        'reason',
+        'level',
+        'path',
+        'fallbackTarget',
+        'isHead',
+      ]);
+
+      // 3. Method reject
+      await router.handle({ method: 'POST', url: '/' } as IncomingMessage, createFakeRes());
+      const methodDec = decisions.find(
+        (d) => d.action === 'Router' && d.choice === 'reject request (405)',
+      );
+      assert.ok(methodDec);
+      assert.deepEqual(Object.keys(methodDec), [
+        'action',
+        'choice',
+        'reason',
+        'level',
+        'method',
+        'allowedMethods',
+        'statusCode',
+        'path',
+      ]);
+
+      // 4. Path reject
+      await router.handle(
+        { method: 'GET', url: '/../etc/passwd' } as IncomingMessage,
+        createFakeRes(),
+      );
+      const pathDec = decisions.find(
+        (d) => d.action === 'Router' && d.choice === 'reject request (400)',
+      );
+      assert.ok(pathDec);
+      assert.deepEqual(Object.keys(pathDec), [
+        'action',
+        'choice',
+        'reason',
+        'level',
+        'path',
+        'statusCode',
+      ]);
+    });
+
+    void it('should set Content-Length on /health responses for both GET and HEAD', async () => {
+      const { logger } = createCapturingLogger();
+      const headers: Record<string, string> = {};
+      const fakeRes = {
+        headersSent: false,
+        destroyed: false,
+        writableEnded: false,
+        statusCode: 200,
+        setHeader(name: string, value: string) {
+          headers[name.toLowerCase()] = String(value);
+        },
+        end() {},
+      } as unknown as ServerResponse;
+
+      const handler = new DefaultHealthCheckHandler(undefined, logger);
+      const handledGet = handler.handle('health', fakeRes, false);
+      assert.equal(handledGet, true);
+      assert.ok(headers['content-length']);
+      const getLen = Number(headers['content-length']);
+      assert.ok(getLen > 0);
+
+      const handledHead = handler.handle('health', fakeRes, true);
+      assert.equal(handledHead, true);
+      assert.ok(headers['content-length']);
     });
   });
 });
