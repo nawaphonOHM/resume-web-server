@@ -37,9 +37,7 @@ export default defineConfig([
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
       ],
-      '@typescript-eslint/no-floating-promises': [
-        'error'
-      ],
+      '@typescript-eslint/no-floating-promises': ['error'],
       '@typescript-eslint/no-explicit-any': 'error',
       '@typescript-eslint/consistent-type-assertions': 'error',
       'no-unreachable': 'error',
@@ -70,41 +68,6 @@ export default defineConfig([
       'no-empty': 'error',
       'no-else-return': 'error',
       'import/no-duplicates': 'error',
-
-      // --- misspell equivalent ---
-      // 'spellcheck/spell-checker': [
-      //   'warn',
-      //   {
-      //     comments: true,
-      //     strings: true,
-      //     identifiers: true,
-      //     templates: true,
-      //     skipWords: [
-      //       'cloudbuild',
-      //       'Gcs',
-      //       'winston',
-      //       'req',
-      //       'Gzip',
-      //       'etag',
-      //       'Etag',
-      //       'gzip',
-      //       'br',
-      //       'gzipped',
-      //       'unpipe',
-      //       'utf',
-      //       'charset',
-      //       'msg',
-      //       'Msg',
-      //       'Sanitizer',
-      //       'passwd',
-      //       'posix',
-      //       'uptime',
-      //       'Readonly',
-      //       'nosniff',
-      //       'clickjacking',
-      //     ],
-      //   },
-      // ],
 
       // --- modernize & naming rules ---
       'unicorn/filename-case': [

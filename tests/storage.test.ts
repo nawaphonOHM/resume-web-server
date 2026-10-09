@@ -13,9 +13,9 @@ import {
   RFC9110EtagFormatter,
   GcsErrorClassifier,
   type StorageServiceOptions,
-} from '../src/storage.ts';
-import type { ServerConfig } from '../src/config.ts';
-import { createAppLogger, type AppLogger, type DecisionLogPayload } from '../src/logger.ts';
+} from '../src/storage/storage.ts';
+import type { ServerConfig } from '../src/config/config.ts';
+import { createAppLogger, type AppLogger, type DecisionLogPayload } from '../src/logger/logger.ts';
 import winston from 'winston';
 
 const silentLogger = createAppLogger({ silent: true });
@@ -1996,6 +1996,240 @@ void describe('GCS Storage Service', () => {
       const resolved = service.resolveObjectName('main.js');
       assert.equal(resolved, 'resume_cloudbuild/angular/main.js');
       assert.equal(decisions.length, 1);
+    });
+
+    void it('should merge options object with positional storageClient and logger', async () => {
+      const { logger, decisions } = createCapturingLogger();
+      const files = new Map<string, MockFileOptions>([['opt-prefix/app.js', { exists: true }]]);
+      const service = createStorageService(
+        { config: { ...testConfig, prefix: 'opt-prefix', bucketName: 'opt-bucket' } },
+        createMockStorage(files),
+        logger,
+      );
+
+      const exists = await service.fileExists('app.js');
+      assert.equal(exists, true);
+      const keyDecisions = decisions.filter((d) => d.action === 'StorageKey');
+      assert.equal(keyDecisions.length, 1);
+      assert.equal(keyDecisions[0]?.choice, 'opt-prefix/app.js');
+    });
+  });
+
+  void describe('Storage contract regression', () => {
+    void it('should log StorageEtag gzip payloads with original keys and omit-headers choice', async () => {
+      const { logger, decisions } = createCapturingLogger();
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/gzip-no-etag.js',
+          {
+            content: 'decompressed',
+            emitResponseEvent: {
+              statusCode: 200,
+              headers: { 'content-encoding': 'gzip', 'content-length': '12' },
+            },
+            metadata: { contentEncoding: 'gzip', size: 12 },
+          },
+        ],
+      ]);
+      const service = new GcsStorageService({
+        config: testConfig,
+        storageClient: createMockStorage(files),
+        logger,
+      });
+      const testEnv = await startTestServer(service, (_req, res, s) => {
+        void s.streamFile('gzip-no-etag.js', res, 'application/javascript', false, false);
+      });
+      try {
+        await executeRequest(testEnv.server, '/gzip-no-etag.js', 'GET');
+        const etagDecisions = decisions.filter((d) => d.action === 'StorageEtag');
+        assert.equal(etagDecisions.length, 1);
+        assert.deepEqual(Object.keys(etagDecisions[0] ?? {}), [
+          'action',
+          'choice',
+          'reason',
+          'level',
+          'rawEtag',
+          'formattedEtag',
+          'contentEncoding',
+          'isGzip',
+          'path',
+          'omittedHeaders',
+        ]);
+        assert.equal(etagDecisions[0]?.choice, 'Omit Content-Length and Content-Encoding');
+        assert.equal(etagDecisions[0]?.formattedEtag, undefined);
+        assert.equal(etagDecisions[0]?.contentEncoding, 'gzip');
+        assert.equal(etagDecisions[0]?.path, 'resume_cloudbuild/angular/gzip-no-etag.js');
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should not log StorageEtag for non-gzip objects without an ETag', async () => {
+      const { logger, decisions } = createCapturingLogger();
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/plain-no-etag.js',
+          {
+            content: 'plain',
+            emitResponseEvent: { statusCode: 200, headers: { 'content-length': '5' } },
+            metadata: { size: 5 },
+          },
+        ],
+      ]);
+      const service = new GcsStorageService({
+        config: testConfig,
+        storageClient: createMockStorage(files),
+        logger,
+      });
+      const testEnv = await startTestServer(service, (_req, res, s) => {
+        void s.streamFile('plain-no-etag.js', res, 'application/javascript', false, false);
+      });
+      try {
+        await executeRequest(testEnv.server, '/plain-no-etag.js', 'GET');
+        assert.equal(decisions.filter((d) => d.action === 'StorageEtag').length, 0);
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should omit isHead and errorType from fileExists ErrorClassifier payloads', async () => {
+      const { logger, decisions } = createCapturingLogger();
+      const customFile = {
+        exists: () =>
+          Promise.reject(Object.assign(new Error('No such object: missing.js'), { code: 404 })),
+      } as unknown as File;
+      const service = new GcsStorageService({
+        config: testConfig,
+        storageClient: { bucket: () => ({ file: () => customFile }) } as unknown as Storage,
+        logger,
+      });
+      assert.equal(await service.fileExists('missing.js'), false);
+      const payload = decisions.find((d) => d.action === 'ErrorClassifier');
+      assert.deepEqual(Object.keys(payload ?? {}), [
+        'action',
+        'choice',
+        'reason',
+        'level',
+        'statusCode',
+        'path',
+        'is404',
+      ]);
+      assert.equal('isHead' in (payload ?? {}), false);
+      assert.equal('errorType' in (payload ?? {}), false);
+    });
+
+    void it('should map custom notFoundStatusCode to "<code> Bad Gateway" with caller reason', async () => {
+      const { logger, decisions } = createCapturingLogger();
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/spa.html',
+          {
+            errorOnStream: Object.assign(new Error('No such object: spa.html'), { code: 404 }),
+          },
+        ],
+      ]);
+      const service = new GcsStorageService({
+        config: testConfig,
+        storageClient: createMockStorage(files),
+        logger,
+      });
+      const testEnv = await startTestServer(service, (_req, res, s) => {
+        void s.streamFile('spa.html', res, 'text/html', false, false, 400);
+      });
+      try {
+        const res = await executeRequest(testEnv.server, '/spa.html', 'GET');
+        assert.equal(res.statusCode, 400);
+        const payload = decisions.find((d) => d.action === 'ErrorClassifier');
+        assert.equal(payload?.choice, '400 Bad Gateway');
+        assert.equal(
+          payload?.reason,
+          'GCS error indicated object not found, mapped to 400 by caller (missing SPA index.html fallback)',
+        );
+        assert.equal(payload?.isHead, false);
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should reject streamFile on setup errors instead of throwing synchronously', async () => {
+      const boom = new Error('bucket.file failed');
+      const storage = {
+        bucket: () => ({
+          file: () => {
+            throw boom;
+          },
+        }),
+      } as unknown as Storage;
+      const service = new GcsStorageService(
+        testConfig,
+        storage,
+        undefined,
+        undefined,
+        undefined,
+        silentLogger,
+      );
+      const fakeRes = {
+        headersSent: false,
+        destroyed: false,
+        writableEnded: false,
+        statusCode: 200,
+        removeHeader() {},
+        setHeader() {},
+        end() {},
+        destroy() {},
+      } as unknown as http.ServerResponse;
+      let thrown: unknown;
+      let result: Promise<void> | undefined;
+      try {
+        result = service.streamFile('x.js', fakeRes, 'text/plain', false);
+      } catch (err) {
+        thrown = err;
+      }
+      assert.equal(thrown, undefined);
+      assert.equal(typeof result?.then, 'function');
+      await assert.rejects(result ?? Promise.resolve(), boom);
+    });
+
+    void it('should treat HEAD errors on a destroyed response as abort-mid-stream', async () => {
+      const { logger, decisions, logs } = createCapturingLogger();
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/gone.js',
+          {
+            errorOnMetadata: Object.assign(new Error('No such object: gone.js'), { code: 404 }),
+          },
+        ],
+      ]);
+      const service = new GcsStorageService({
+        config: testConfig,
+        storageClient: createMockStorage(files),
+        logger,
+      });
+      const fakeRes = {
+        headersSent: false,
+        destroyed: true,
+        writableEnded: false,
+        statusCode: 200,
+        removeHeader() {},
+        setHeader() {},
+        end() {
+          throw new Error('end should not be called');
+        },
+        destroy() {
+          throw new Error('destroy should not be called');
+        },
+      } as unknown as http.ServerResponse;
+      await service.streamFile('gone.js', fakeRes, 'text/plain', false, true);
+      const errorLogs = logs.filter((entry) => entry.level === 'error');
+      assert.equal(errorLogs.length, 1);
+      assert.equal(
+        errorLogs[0]?.message,
+        'Failed to retrieve metadata for asset from storage (connection aborted mid-stream)',
+      );
+      const payload = decisions.find((d) => d.action === 'ErrorClassifier');
+      assert.equal(payload?.choice, '404 Not Found');
+      assert.equal(payload?.isHead, true);
+      assert.equal(payload?.headersSent, undefined);
     });
   });
 });

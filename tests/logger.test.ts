@@ -24,10 +24,11 @@ import {
   escapeForConsole,
   escapeCallStack,
   safeStringify,
+  sanitizeAllErrorsInValue,
   type AppLogger,
   type DecisionLogPayload,
   type LogLevel,
-} from '../src/logger.ts';
+} from '../src/logger/logger.ts';
 
 /**
  * Custom memory writable stream to capture formatted log output in tests.
@@ -114,6 +115,17 @@ void describe('Application Logger Module', () => {
       circular['self'] = circular;
       assert.equal(safeStringify(circular), '[Unserializable Object]');
     });
+
+    void it('should stringify function values to null', () => {
+      assert.equal(
+        safeStringify(() => 1),
+        'null',
+      );
+      function secretFn() {
+        return 'SECRET_TOKEN';
+      }
+      assert.equal(safeStringify(secretFn), 'null');
+    });
   });
 
   void describe('resolveLogLevel and isErrorObject utilities', () => {
@@ -176,6 +188,17 @@ void describe('Application Logger Module', () => {
       assert.equal(sanitizeErrorMessage(circularObj), 'initial');
     });
 
+    void it('should sanitize function values to null with sanitizeErrorMessage', () => {
+      assert.equal(
+        sanitizeErrorMessage(() => 1),
+        'null',
+      );
+      function secretFn() {
+        return 'SECRET_TOKEN';
+      }
+      assert.equal(sanitizeErrorMessage(secretFn), 'null');
+    });
+
     void it('should wrap minimal server logger and handle level delegation via toAppLogger', () => {
       const logs: { level: string; msg: string; meta?: unknown }[] = [];
       const minimal = {
@@ -232,6 +255,35 @@ void describe('Application Logger Module', () => {
       assert.equal(formatErrorDetail({ name: 'CustomErr', message: 'Fail' }), 'CustomErr: Fail');
       assert.equal(formatErrorDetail('raw error string'), 'Error: raw error string');
       assert.equal(formatErrorDetail(404), 'Error: 404');
+    });
+  });
+
+  void describe('sanitizeAllErrorsInValue utility', () => {
+    void it('should preserve primitives and sanitize errors', () => {
+      assert.equal(sanitizeAllErrorsInValue('test'), 'test');
+      assert.equal(sanitizeAllErrorsInValue(123), 123);
+      assert.equal(sanitizeAllErrorsInValue(true), true);
+      assert.equal(sanitizeAllErrorsInValue(null), null);
+      assert.equal(sanitizeAllErrorsInValue(undefined), undefined);
+      assert.equal(sanitizeAllErrorsInValue(10n), '10');
+      const err = new Error('boom');
+      assert.deepEqual(sanitizeAllErrorsInValue(err), { name: 'Error', message: 'boom' });
+    });
+
+    void it('should serialize functions and function properties to null without leaking code', () => {
+      assert.equal(
+        sanitizeAllErrorsInValue(() => 1),
+        'null',
+      );
+      function secretFn() {
+        return 'SECRET_KEY';
+      }
+      assert.equal(sanitizeAllErrorsInValue(secretFn), 'null');
+      assert.deepEqual(sanitizeAllErrorsInValue({ handler: secretFn }), { handler: 'null' });
+      assert.deepEqual(sanitizeAllErrorsInValue({ nested: { fn: () => 1 } }), {
+        nested: { fn: 'null' },
+      });
+      assert.deepEqual(sanitizeAllErrorsInValue([secretFn]), ['null']);
     });
   });
 
@@ -1340,6 +1392,38 @@ void describe('Application Logger Module', () => {
           '[warn]: Decision [HttpMethodValidator] | Choice: reject request (405)',
         ),
       );
+    });
+
+    void it('should sanitize function values in console and JSON metadata without leaking source code', () => {
+      function secretCallback() {
+        return 'SECRET_PASSWORD_TOKEN';
+      }
+
+      // Console format
+      const consoleLog = createMemoryLogger();
+      consoleLog.appLogger.info('fnmeta', { handler: secretCallback });
+      assert.ok(consoleLog.stream.output.includes('Handler: null'));
+      assert.ok(!consoleLog.stream.output.includes('secretCallback'));
+      assert.ok(!consoleLog.stream.output.includes('SECRET_PASSWORD_TOKEN'));
+
+      // JSON format
+      const jsonLog = createMemoryLogger({ json: true });
+      jsonLog.appLogger.info('fnmeta', { handler: secretCallback });
+      const parsedJson = JSON.parse(jsonLog.stream.output.trim()) as Record<string, unknown>;
+      assert.equal(parsedJson['handler'], 'null');
+      assert.ok(!jsonLog.stream.output.includes('secretCallback'));
+      assert.ok(!jsonLog.stream.output.includes('SECRET_PASSWORD_TOKEN'));
+
+      // Decision telemetry
+      consoleLog.stream.clear();
+      consoleLog.appLogger.decision({
+        action: 'Auth',
+        choice: 'Authenticate',
+        reason: 'Valid token',
+        cb: secretCallback,
+      } as unknown as DecisionLogPayload);
+      assert.ok(consoleLog.stream.output.includes('Cb: null'));
+      assert.ok(!consoleLog.stream.output.includes('secretCallback'));
     });
   });
 });
