@@ -1984,7 +1984,7 @@ void describe('HTTP Router & Request Handler', () => {
       const customThrowable = { code: 503, reason: 'GCS backend timeout' };
 
       const failingStorage: StorageService = {
-        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+
         streamFile: () => Promise.reject(customThrowable),
         fileExists: () => Promise.resolve(true),
         resolveObjectName: (n) => n,
