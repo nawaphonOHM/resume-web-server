@@ -12,7 +12,15 @@ import {
   StoragePathResolver,
   RFC9110EtagFormatter,
   GcsErrorClassifier,
+  StorageObjectLocator,
+  parseTimestampFromDirectory,
+  computeDirectPath,
+  extractCandidateMatch,
+  compareCandidates,
+  resolveStorageDeps,
   type StorageServiceOptions,
+  type IStorageObjectLocator,
+  type CandidateFileMatch,
 } from '../src/storage/storage.ts';
 import type { ServerConfig } from '../src/config/config.ts';
 import { createAppLogger, type AppLogger, type DecisionLogPayload } from '../src/logger/logger.ts';
@@ -139,10 +147,12 @@ interface MockFileOptions {
  * Factory function creating a mocked `@google-cloud/storage` {@link File} instance.
  *
  * @param options - Configuration options for mocked metadata, existence status, stream content, and error events.
+ * @param name - Object name for the mocked file.
  * @returns A mocked {@link File} instance satisfying GCS read and metadata operations.
  */
-function createMockFile(options: MockFileOptions): File {
+function createMockFile(options: MockFileOptions, name = 'test-file'): File {
   return {
+    name,
     exists: () => Promise.resolve([options.exists ?? true]),
     getMetadata: () => {
       if (options.errorOnMetadata) {
@@ -220,7 +230,18 @@ function createMockStorage(fileMap: Map<string, MockFileOptions>): Storage {
         errorOnMetadata: Object.assign(new Error(`No such object: ${name}`), { code: 404 }),
         exists: false,
       };
-      return createMockFile(opts);
+      return createMockFile(opts, name);
+    },
+    getFiles: (query?: { prefix?: string }) => {
+      const pfx = query?.prefix ?? '';
+      const matchedFiles: File[] = [];
+      for (const [name, opts] of fileMap.entries()) {
+        if (opts.exists === false) continue;
+        if (!pfx || name.startsWith(pfx)) {
+          matchedFiles.push(createMockFile(opts, name));
+        }
+      }
+      return Promise.resolve([matchedFiles, null]);
     },
   } as unknown as Bucket;
 
@@ -1484,7 +1505,10 @@ void describe('GCS Storage Service', () => {
           ),
       } as unknown as File;
       const customStorage = {
-        bucket: () => ({ file: () => customFile }),
+        bucket: () => ({
+          file: () => customFile,
+          getFiles: () => Promise.resolve([[], null]),
+        }),
       } as unknown as Storage;
 
       const serviceWithRejection = new GcsStorageService({
@@ -2100,7 +2124,12 @@ void describe('GCS Storage Service', () => {
       } as unknown as File;
       const service = new GcsStorageService({
         config: testConfig,
-        storageClient: { bucket: () => ({ file: () => customFile }) } as unknown as Storage,
+        storageClient: {
+          bucket: () => ({
+            file: () => customFile,
+            getFiles: () => Promise.resolve([[], null]),
+          }),
+        } as unknown as Storage,
         logger,
       });
       assert.equal(await service.fileExists('missing.js'), false);
@@ -2151,43 +2180,54 @@ void describe('GCS Storage Service', () => {
       }
     });
 
-    void it('should reject streamFile on setup errors instead of throwing synchronously', async () => {
+    void it('should handle locator/setup errors in streamFile with 502 Bad Gateway response', async () => {
+      const { logger, decisions, logs } = createCapturingLogger();
       const boom = new Error('bucket.file failed');
       const storage = {
         bucket: () => ({
           file: () => {
             throw boom;
           },
+          getFiles: () => Promise.resolve([[], null]),
         }),
       } as unknown as Storage;
-      const service = new GcsStorageService(
-        testConfig,
-        storage,
-        undefined,
-        undefined,
-        undefined,
-        silentLogger,
-      );
+      const service = new GcsStorageService({
+        config: testConfig,
+        storageClient: storage,
+        logger,
+      });
+      let statusCode = 200;
+      let body = '';
       const fakeRes = {
         headersSent: false,
         destroyed: false,
         writableEnded: false,
-        statusCode: 200,
+        get statusCode() {
+          return statusCode;
+        },
+        set statusCode(val: number) {
+          statusCode = val;
+        },
         removeHeader() {},
         setHeader() {},
-        end() {},
+        end(data?: string) {
+          if (data) body += data;
+        },
         destroy() {},
       } as unknown as http.ServerResponse;
-      let thrown: unknown;
-      let result: Promise<void> | undefined;
-      try {
-        result = service.streamFile('x.js', fakeRes, 'text/plain', false);
-      } catch (err) {
-        thrown = err;
-      }
-      assert.equal(thrown, undefined);
-      assert.equal(typeof result?.then, 'function');
-      await assert.rejects(result ?? Promise.resolve(), boom);
+
+      await service.streamFile('x.js', fakeRes, 'text/plain', false);
+      assert.equal(statusCode, 502);
+      assert.equal(body, 'Bad Gateway');
+      const payload = decisions.find((d) => d.action === 'ErrorClassifier');
+      assert.equal(payload?.choice, '502 Bad Gateway');
+      assert.equal(
+        payload?.reason,
+        'GCS error indicates bucket missing or storage backend failure',
+      );
+      assert.equal(payload?.['is404'], false);
+      const errorLog = logs.find((l) => l.level === 'error');
+      assert.equal(errorLog?.message, 'Failed to stream asset from storage');
     });
 
     void it('should treat HEAD errors on a destroyed response as abort-mid-stream', async () => {
@@ -2230,6 +2270,904 @@ void describe('GCS Storage Service', () => {
       assert.equal(payload?.choice, '404 Not Found');
       assert.equal(payload?.isHead, true);
       assert.equal(payload?.headersSent, undefined);
+    });
+  });
+
+  describe('StorageObjectLocator & Recursive Search', () => {
+    describe('parseTimestampFromDirectory', () => {
+      void it('should parse unix timestamp from <unixtime>_<SomeString>', () => {
+        assert.equal(parseTimestampFromDirectory('1712345678_v1'), 1712345678);
+        assert.equal(parseTimestampFromDirectory('1720000000_release-2024'), 1720000000);
+        assert.equal(parseTimestampFromDirectory('0_initial'), 0);
+        assert.equal(parseTimestampFromDirectory('1700000000_some_nested_tag_123'), 1700000000);
+      });
+
+      void it('should return null for non-timestamped or invalid directory formats', () => {
+        assert.equal(parseTimestampFromDirectory('dist'), null);
+        assert.equal(parseTimestampFromDirectory('assets'), null);
+        assert.equal(parseTimestampFromDirectory('v1_1712345678'), null);
+        assert.equal(parseTimestampFromDirectory('1712345678'), null);
+        assert.equal(parseTimestampFromDirectory('_build'), null);
+        assert.equal(parseTimestampFromDirectory('-100_v1'), null);
+        assert.equal(parseTimestampFromDirectory('abc_v1'), null);
+        assert.equal(parseTimestampFromDirectory(''), null);
+      });
+    });
+
+    describe('computeDirectPath', () => {
+      void it('should prepend prefix to relative path without duplicating slashes', () => {
+        assert.equal(
+          computeDirectPath('main.js', 'resume_cloudbuild/angular'),
+          'resume_cloudbuild/angular/main.js',
+        );
+        assert.equal(
+          computeDirectPath('main.js', '/resume_cloudbuild/angular/'),
+          'resume_cloudbuild/angular/main.js',
+        );
+      });
+
+      void it('should avoid prepending prefix if already present', () => {
+        assert.equal(
+          computeDirectPath('resume_cloudbuild/angular/main.js', 'resume_cloudbuild/angular'),
+          'resume_cloudbuild/angular/main.js',
+        );
+      });
+
+      void it('should return clean name when prefix is empty', () => {
+        assert.equal(computeDirectPath('main.js', ''), 'main.js');
+        assert.equal(computeDirectPath('main.js', '///'), 'main.js');
+      });
+    });
+
+    describe('extractCandidateMatch & compareCandidates', () => {
+      void it('should extract candidate match from timestamped deployment path', () => {
+        const file = createMockFile({}, 'resume/1712345678_v1/browser/main.js');
+        const match = extractCandidateMatch(file, 'resume', 'main.js');
+        assert.ok(match);
+        assert.equal(match.unixtime, 1712345678);
+        assert.equal(match.directoryName, '1712345678_v1');
+        assert.equal(match.fullPath, 'resume/1712345678_v1/browser/main.js');
+      });
+
+      void it('should extract candidate match from unversioned directory or root', () => {
+        const file1 = createMockFile({}, 'resume/unversioned/main.js');
+        const match1 = extractCandidateMatch(file1, 'resume', 'main.js');
+        assert.ok(match1);
+        assert.equal(match1.unixtime, null);
+        assert.equal(match1.directoryName, 'unversioned');
+
+        const file2 = createMockFile({}, 'resume/main.js');
+        const match2 = extractCandidateMatch(file2, 'resume', 'main.js');
+        assert.ok(match2);
+        assert.equal(match2.unixtime, null);
+        assert.equal(match2.directoryName, '');
+      });
+
+      void it('should return null when basename does not match or is a directory marker', () => {
+        const file1 = createMockFile({}, 'resume/1712345678_v1/styles.css');
+        assert.equal(extractCandidateMatch(file1, 'resume', 'main.js'), null);
+
+        const file2 = createMockFile({}, 'resume/1712345678_v1/main.js/');
+        assert.equal(extractCandidateMatch(file2, 'resume', 'main.js'), null);
+      });
+
+      void it('should enforce prefix boundary so other prefixes are excluded', () => {
+        const file = createMockFile({}, 'resumextra/1712345678_v1/main.js');
+        assert.equal(extractCandidateMatch(file, 'resume', 'main.js'), null);
+      });
+
+      void it('should sort timestamped candidates descending from newest to oldest', () => {
+        const c1: CandidateFileMatch = {
+          file: createMockFile({}, 'resume/1710000000_v1/main.js'),
+          fullPath: 'resume/1710000000_v1/main.js',
+          unixtime: 1710000000,
+          directoryName: '1710000000_v1',
+        };
+        const c2: CandidateFileMatch = {
+          file: createMockFile({}, 'resume/1720000000_v2/main.js'),
+          fullPath: 'resume/1720000000_v2/main.js',
+          unixtime: 1720000000,
+          directoryName: '1720000000_v2',
+        };
+        const c3: CandidateFileMatch = {
+          file: createMockFile({}, 'resume/unversioned/main.js'),
+          fullPath: 'resume/unversioned/main.js',
+          unixtime: null,
+          directoryName: 'unversioned',
+        };
+
+        const list = [c1, c3, c2];
+        list.sort(compareCandidates);
+        assert.equal(list[0]?.fullPath, 'resume/1720000000_v2/main.js');
+        assert.equal(list[1]?.fullPath, 'resume/1710000000_v1/main.js');
+        assert.equal(list[2]?.fullPath, 'resume/unversioned/main.js');
+      });
+
+      void it('should break ties deterministically when timestamps are identical or absent', () => {
+        const c1: CandidateFileMatch = {
+          file: createMockFile({}, 'resume/1720000000_v2/b/main.js'),
+          fullPath: 'resume/1720000000_v2/b/main.js',
+          unixtime: 1720000000,
+          directoryName: '1720000000_v2',
+        };
+        const c2: CandidateFileMatch = {
+          file: createMockFile({}, 'resume/1720000000_v2/a/main.js'),
+          fullPath: 'resume/1720000000_v2/a/main.js',
+          unixtime: 1720000000,
+          directoryName: '1720000000_v2',
+        };
+        const list = [c1, c2];
+        list.sort(compareCandidates);
+        assert.equal(list[0]?.fullPath, 'resume/1720000000_v2/a/main.js');
+        assert.equal(list[1]?.fullPath, 'resume/1720000000_v2/b/main.js');
+      });
+    });
+
+    describe('StorageObjectLocator direct and recursive search execution', () => {
+      void it('should resolve directly when object exists at root prefix and bypass getFiles', async () => {
+        let getFilesCalled = false;
+        const mockBucket = {
+          file: (name: string) => {
+            return createMockFile({ exists: name === 'app/main.js' }, name);
+          },
+          getFiles: () => {
+            getFilesCalled = true;
+            return Promise.resolve([[], null]);
+          },
+        } as unknown as Bucket;
+
+        const locator = new StorageObjectLocator();
+        const res = await locator.locateFile(mockBucket, 'main.js', 'app');
+        assert.ok(res);
+        assert.equal(res.strategy, 'direct');
+        assert.equal(res.fullPath, 'app/main.js');
+        assert.equal(getFilesCalled, false);
+      });
+
+      void it('should fallback to recursive search on direct 404 and pick newest deployment', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1710000000_v1/dist/main.js', { content: 'v1' }],
+          ['app/1720000000_v2/dist/main.js', { content: 'v2' }],
+          ['app/1715000000_v1.5/dist/main.js', { content: 'v1.5' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+        const res = await locator.locateFile(storage.bucket('b'), 'main.js', 'app');
+        assert.ok(res);
+        assert.equal(res.strategy, 'recursive');
+        assert.equal(res.fullPath, 'app/1720000000_v2/dist/main.js');
+        assert.equal(res.unixtime, 1720000000);
+      });
+
+      void it('should locate deeply nested files within a timestamped deployment directory', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1725000000_build/nested/deep/bundle.css', { content: 'body { color: red; }' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+        const res = await locator.locateFile(storage.bucket('b'), 'bundle.css', 'app');
+        assert.ok(res);
+        assert.equal(res.strategy, 'recursive');
+        assert.equal(res.fullPath, 'app/1725000000_build/nested/deep/bundle.css');
+        assert.equal(res.unixtime, 1725000000);
+      });
+
+      void it('should return null when object is not found directly or recursively', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1720000000_v2/dist/other.js', { content: 'other' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+        const res = await locator.locateFile(storage.bucket('b'), 'nonexistent.js', 'app');
+        assert.equal(res, null);
+      });
+
+      void it('should return null when object name is empty', async () => {
+        const storage = createMockStorage(new Map());
+        const locator = new StorageObjectLocator();
+        const res = await locator.locateFile(storage.bucket('b'), '', 'app');
+        assert.equal(res, null);
+      });
+
+      void it('should handle pagination when bucket.getFiles returns nextQuery token', async () => {
+        const file1 = createMockFile({}, 'app/1710000000_v1/main.js');
+        const file2 = createMockFile({}, 'app/1730000000_v3/main.js');
+        let callCount = 0;
+        const mockBucket = {
+          file: (name: string) => createMockFile({ exists: false }, name),
+          getFiles: (query?: { prefix?: string; pageToken?: string }) => {
+            callCount += 1;
+            if (!query?.pageToken) {
+              return Promise.resolve([[file1], { prefix: 'app/', pageToken: 'page2' }]);
+            }
+            return Promise.resolve([[file2], null]);
+          },
+        } as unknown as Bucket;
+
+        const locator = new StorageObjectLocator();
+        const res = await locator.locateFile(mockBucket, 'main.js', 'app');
+        assert.ok(res);
+        assert.equal(callCount, 2);
+        assert.equal(res.fullPath, 'app/1730000000_v3/main.js');
+        assert.equal(res.unixtime, 1730000000);
+      });
+
+      void it('should pass normalized search prefix with trailing slash or empty query to bucket.getFiles', async () => {
+        const capturedQueries: Array<Record<string, unknown> | undefined> = [];
+        const mockBucket = {
+          file: (name: string) => createMockFile({ exists: false }, name),
+          getFiles: (query?: Record<string, unknown>) => {
+            capturedQueries.push(query);
+            return Promise.resolve([[], null]);
+          },
+        } as unknown as Bucket;
+
+        const locator = new StorageObjectLocator();
+
+        // 1. Unnormalized prefix 'app' -> formatted to 'app/'
+        await locator.locateFile(mockBucket, 'main.js', 'app');
+        assert.equal(capturedQueries.length, 1);
+        assert.deepEqual(capturedQueries[0], { prefix: 'app/', autoPaginate: false });
+
+        // 2. Prefix with leading/trailing slashes '/app/' -> formatted to 'app/'
+        await locator.locateFile(mockBucket, 'main.js', '/app/');
+        assert.equal(capturedQueries.length, 2);
+        assert.deepEqual(capturedQueries[1], { prefix: 'app/', autoPaginate: false });
+
+        // 3. Root / empty prefix '' -> formatted to '' (no prefix property)
+        await locator.locateFile(mockBucket, 'main.js', '');
+        assert.equal(capturedQueries.length, 3);
+        assert.deepEqual(capturedQueries[2], { autoPaginate: false });
+
+        // 4. Root slash prefix '/' -> formatted to '' (no prefix property)
+        await locator.locateFile(mockBucket, 'main.js', '/');
+        assert.equal(capturedQueries.length, 4);
+        assert.deepEqual(capturedQueries[3], { autoPaginate: false });
+      });
+
+      void it('should reject when getFiles fails with 404 error (e.g. bucket not found or storage API error)', async () => {
+        const notFoundError = Object.assign(new Error('Bucket not found'), { code: 404 });
+        const mockBucket = {
+          file: (name: string) => createMockFile({ exists: false }, name),
+          getFiles: () => Promise.reject(notFoundError),
+        } as unknown as Bucket;
+
+        const locator = new StorageObjectLocator();
+        await assert.rejects(locator.locateFile(mockBucket, 'main.js', 'app'), notFoundError);
+      });
+
+      void it('should rethrow 500 error from getFiles', async () => {
+        const serverError = Object.assign(new Error('Internal storage error'), { code: 500 });
+        const mockBucket = {
+          file: (name: string) => createMockFile({ exists: false }, name),
+          getFiles: () => Promise.reject(serverError),
+        } as unknown as Bucket;
+
+        const locator = new StorageObjectLocator();
+        await assert.rejects(locator.locateFile(mockBucket, 'main.js', 'app'), serverError);
+      });
+
+      void it('should rethrow 500 error from direct existence check', async () => {
+        const serverError = Object.assign(new Error('Storage unavailable'), { code: 503 });
+        const mockBucket = {
+          file: (name: string) => ({
+            name,
+            exists: () => Promise.reject(serverError),
+          }),
+        } as unknown as Bucket;
+
+        const locator = new StorageObjectLocator();
+        await assert.rejects(locator.locateFile(mockBucket, 'main.js', 'app'), serverError);
+      });
+    });
+
+    describe('StorageObjectLocator telemetry decision logging', () => {
+      void it('should log direct hit decision with action StorageLocator', async () => {
+        const { logger, decisions } = createCapturingLogger();
+        const files = new Map<string, MockFileOptions>([['app/main.js', { content: 'direct' }]]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator(undefined, logger);
+
+        await locator.locateFile(storage.bucket('b'), 'main.js', 'app');
+        const decision = decisions.find((d) => d.action === 'StorageLocator');
+        assert.ok(decision);
+        assert.equal(decision.choice, 'direct: app/main.js');
+        assert.equal(decision['strategy'], 'direct');
+        assert.equal(decision['fullPath'], 'app/main.js');
+        assert.equal(decision['objectName'], 'main.js');
+        assert.equal(decision['prefix'], 'app');
+      });
+
+      void it('should log recursive discovery decision with timestamp and fullPath', async () => {
+        const { logger, decisions } = createCapturingLogger();
+        const files = new Map<string, MockFileOptions>([
+          ['app/1720000000_v2/dist/main.js', { content: 'v2' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator(undefined, logger);
+
+        await locator.locateFile(storage.bucket('b'), 'main.js', 'app');
+        const decision = decisions.find((d) => d.action === 'StorageLocator');
+        assert.ok(decision);
+        assert.equal(decision.choice, 'recursive: app/1720000000_v2/dist/main.js');
+        assert.equal(decision['strategy'], 'recursive');
+        assert.equal(decision['fullPath'], 'app/1720000000_v2/dist/main.js');
+        assert.equal(decision['unixtime'], 1720000000);
+      });
+
+      void it('should log not found decision when object is absent', async () => {
+        const { logger, decisions } = createCapturingLogger();
+        const storage = createMockStorage(new Map());
+        const locator = new StorageObjectLocator(undefined, logger);
+
+        await locator.locateFile(storage.bucket('b'), 'missing.js', 'app');
+        const decision = decisions.find((d) => d.action === 'StorageLocator');
+        assert.ok(decision);
+        assert.equal(decision.choice, 'not found');
+        assert.equal(decision['strategy'], 'none');
+        assert.equal(decision['objectName'], 'missing.js');
+      });
+    });
+
+    describe('StorageService integration with custom locator', () => {
+      void it('should resolve injected custom locator via StorageServiceOptions object', () => {
+        const customLocator: IStorageObjectLocator = {
+          locateFile: (_bucket, name, prefix) =>
+            Promise.resolve({
+              file: createMockFile({}, `${prefix}/${name}`),
+              fullPath: `${prefix}/${name}`,
+              strategy: 'direct',
+            }),
+        };
+
+        const deps = resolveStorageDeps({
+          config: testConfig,
+          locator: customLocator,
+        });
+
+        assert.equal(deps.objectLocator, customLocator);
+      });
+
+      void it('should resolve injected custom locator via positional arguments', () => {
+        const customLocator: IStorageObjectLocator = {
+          locateFile: (_bucket, name, prefix) =>
+            Promise.resolve({
+              file: createMockFile({}, `${prefix}/${name}`),
+              fullPath: `${prefix}/${name}`,
+              strategy: 'direct',
+            }),
+        };
+
+        const deps = resolveStorageDeps(
+          testConfig,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          customLocator,
+        );
+
+        assert.equal(deps.objectLocator, customLocator);
+      });
+
+      void it('should instantiate default StorageObjectLocator with injected errorClassifier and logger', () => {
+        const customClassifier = new GcsErrorClassifier();
+        const { logger } = createCapturingLogger();
+
+        const deps = resolveStorageDeps(
+          testConfig,
+          undefined,
+          undefined,
+          undefined,
+          customClassifier,
+          logger,
+        );
+
+        assert.ok(deps.objectLocator instanceof StorageObjectLocator);
+        assert.equal(
+          (deps.objectLocator as unknown as { errorClassifier: unknown }).errorClassifier,
+          customClassifier,
+        );
+        assert.equal((deps.objectLocator as unknown as { logger: unknown }).logger, logger);
+      });
+
+      void it('should inject custom locator into GcsStorageService and invoke it', async () => {
+        let customLocateCalled = false;
+        const customLocator: IStorageObjectLocator = {
+          locateFile: (_bucket, name, prefix) => {
+            customLocateCalled = true;
+            return Promise.resolve({
+              file: createMockFile({}, `${prefix}/${name}`),
+              fullPath: `${prefix}/${name}`,
+              strategy: 'direct',
+            });
+          },
+        };
+
+        const service = new GcsStorageService({
+          config: testConfig,
+          storageClient: createMockStorage(new Map()),
+          locator: customLocator,
+        });
+
+        assert.ok(service);
+        const resolvedDeps = (
+          service as unknown as { deps: { objectLocator: IStorageObjectLocator } }
+        ).deps;
+        assert.equal(resolvedDeps.objectLocator, customLocator);
+
+        const result = await resolvedDeps.objectLocator.locateFile(
+          (service as unknown as { bucket: Bucket }).bucket,
+          'main.js',
+          testConfig.prefix,
+        );
+        assert.equal(customLocateCalled, true);
+        assert.ok(result);
+        assert.equal(result.strategy, 'direct');
+        assert.equal(result.fullPath, `${testConfig.prefix}/main.js`);
+      });
+    });
+
+    describe('GcsStorageService Recursive Search & Streaming Pipeline Integration', () => {
+      void it('should verify fileExists returns true for relocated files in timestamped directories', async () => {
+        const files = new Map<string, MockFileOptions>([
+          [
+            'resume_cloudbuild/angular/1720000000_release-2024/dist/browser/main.js',
+            { exists: true },
+          ],
+        ]);
+        const service = new GcsStorageService(testConfig, createMockStorage(files));
+
+        const exists = await service.fileExists('main.js');
+        assert.equal(exists, true);
+
+        const notFound = await service.fileExists('non-existent.js');
+        assert.equal(notFound, false);
+      });
+
+      void it('should stream relocated file from newest timestamp deployment directory on GET', async () => {
+        const { logger, decisions } = createCapturingLogger();
+        const files = new Map<string, MockFileOptions>([
+          [
+            'resume_cloudbuild/angular/1710000000_v1/dist/browser/main.js',
+            {
+              content: 'console.log("v1");',
+              metadata: { etag: 'etag-v1', size: 18 },
+              emitResponseEvent: {
+                statusCode: 200,
+                headers: { etag: 'etag-v1', 'content-length': '18' },
+              },
+            },
+          ],
+          [
+            'resume_cloudbuild/angular/1720000000_v2/dist/browser/main.js',
+            {
+              content: 'console.log("v2");',
+              metadata: { etag: 'etag-v2', size: 18 },
+              emitResponseEvent: {
+                statusCode: 200,
+                headers: { etag: 'etag-v2', 'content-length': '18' },
+              },
+            },
+          ],
+        ]);
+
+        const service = new GcsStorageService({
+          config: testConfig,
+          storageClient: createMockStorage(files),
+          logger,
+        });
+
+        const testEnv = await startTestServer(service, (_req, res, s) => {
+          void s.streamFile('main.js', res, 'application/javascript; charset=utf-8', false, false);
+        });
+
+        try {
+          const res = await executeRequest(testEnv.server, '/main.js', 'GET');
+          assert.equal(res.statusCode, 200);
+          assert.equal(res.body, 'console.log("v2");');
+          assert.equal(res.headers['content-type'], 'application/javascript; charset=utf-8');
+          assert.equal(res.headers['cache-control'], 'public, max-age=0, must-revalidate');
+          assert.equal(res.headers['etag'], '"etag-v2"');
+
+          const locateDecision = decisions.find((d) => d.action === 'StorageLocator');
+          assert.ok(locateDecision);
+          assert.equal(
+            locateDecision.choice,
+            'recursive: resume_cloudbuild/angular/1720000000_v2/dist/browser/main.js',
+          );
+          assert.equal(locateDecision['strategy'], 'recursive');
+          assert.equal(
+            locateDecision['fullPath'],
+            'resume_cloudbuild/angular/1720000000_v2/dist/browser/main.js',
+          );
+          assert.equal(locateDecision['unixtime'], 1720000000);
+
+          const streamDecision = decisions.find((d) => d.action === 'StorageStream');
+          assert.ok(streamDecision);
+          assert.equal(
+            streamDecision['fullPath'],
+            'resume_cloudbuild/angular/1720000000_v2/dist/browser/main.js',
+          );
+
+          const etagDecision = decisions.find((d) => d.action === 'StorageEtag');
+          assert.ok(etagDecision);
+          assert.equal(etagDecision['rawEtag'], 'etag-v2');
+          assert.equal(etagDecision['formattedEtag'], '"etag-v2"');
+        } finally {
+          await testEnv.close();
+        }
+      });
+
+      void it('should set immutable Cache-Control header when streaming relocated hashed asset', async () => {
+        const files = new Map<string, MockFileOptions>([
+          [
+            'resume_cloudbuild/angular/1720000000_v2/dist/browser/main-5T7P2N6K.js',
+            {
+              content: 'console.log("hashed");',
+              metadata: { etag: 'etag-hashed', size: 22 },
+              emitResponseEvent: {
+                statusCode: 200,
+                headers: { etag: 'etag-hashed', 'content-length': '22' },
+              },
+            },
+          ],
+        ]);
+
+        const service = new GcsStorageService(testConfig, createMockStorage(files));
+        const testEnv = await startTestServer(service, (_req, res, s) => {
+          void s.streamFile(
+            'main-5T7P2N6K.js',
+            res,
+            'application/javascript; charset=utf-8',
+            true,
+            false,
+          );
+        });
+
+        try {
+          const res = await executeRequest(testEnv.server, '/main-5T7P2N6K.js', 'GET');
+          assert.equal(res.statusCode, 200);
+          assert.equal(res.body, 'console.log("hashed");');
+          assert.equal(res.headers['cache-control'], 'public, max-age=31536000, immutable');
+        } finally {
+          await testEnv.close();
+        }
+      });
+
+      void it('should handle HEAD requests for relocated assets without returning a body', async () => {
+        const { logger, decisions } = createCapturingLogger();
+        const files = new Map<string, MockFileOptions>([
+          [
+            'resume_cloudbuild/angular/1725000000_rel/styles.css',
+            {
+              content: 'body { color: red; }',
+              metadata: { etag: 'etag-css', size: 20 },
+            },
+          ],
+        ]);
+
+        const service = new GcsStorageService({
+          config: testConfig,
+          storageClient: createMockStorage(files),
+          logger,
+        });
+
+        const testEnv = await startTestServer(service, (_req, res, s) => {
+          void s.streamFile('styles.css', res, 'text/css; charset=utf-8', false, true);
+        });
+
+        try {
+          const res = await executeRequest(testEnv.server, '/styles.css', 'HEAD');
+          assert.equal(res.statusCode, 200);
+          assert.equal(res.body, '');
+          assert.equal(res.headers['content-type'], 'text/css; charset=utf-8');
+          assert.equal(res.headers['cache-control'], 'public, max-age=0, must-revalidate');
+          assert.equal(res.headers['etag'], '"etag-css"');
+          assert.equal(res.headers['content-length'], '20');
+
+          const locateDecision = decisions.find((d) => d.action === 'StorageLocator');
+          assert.ok(locateDecision);
+          assert.equal(locateDecision['strategy'], 'recursive');
+          assert.equal(
+            locateDecision['fullPath'],
+            'resume_cloudbuild/angular/1725000000_rel/styles.css',
+          );
+        } finally {
+          await testEnv.close();
+        }
+      });
+
+      void it('should return 404 when object is not found directly or recursively', async () => {
+        const { logger, decisions } = createCapturingLogger();
+        const files = new Map<string, MockFileOptions>([
+          ['resume_cloudbuild/angular/1720000000_v2/dist/other.js', { exists: true }],
+        ]);
+
+        const service = new GcsStorageService({
+          config: testConfig,
+          storageClient: createMockStorage(files),
+          logger,
+        });
+
+        const testEnv = await startTestServer(service, (_req, res, s) => {
+          void s.streamFile(
+            'missing.js',
+            res,
+            'application/javascript; charset=utf-8',
+            false,
+            false,
+          );
+        });
+
+        try {
+          const res = await executeRequest(testEnv.server, '/missing.js', 'GET');
+          assert.equal(res.statusCode, 404);
+          assert.equal(res.body, 'Not Found');
+
+          const locateDecision = decisions.find((d) => d.action === 'StorageLocator');
+          assert.ok(locateDecision);
+          assert.equal(locateDecision.choice, 'not found');
+          assert.equal(locateDecision['strategy'], 'none');
+
+          const errorDecision = decisions.find((d) => d.action === 'ErrorClassifier');
+          assert.ok(errorDecision);
+          assert.equal(errorDecision.choice, '404 Not Found');
+          assert.equal(errorDecision['statusCode'], 404);
+        } finally {
+          await testEnv.close();
+        }
+      });
+
+      void it('should return 502 when index.html is missing with notFoundStatusCode 502', async () => {
+        const { logger, decisions } = createCapturingLogger();
+        const files = new Map<string, MockFileOptions>();
+
+        const service = new GcsStorageService({
+          config: testConfig,
+          storageClient: createMockStorage(files),
+          logger,
+        });
+
+        const testEnv = await startTestServer(service, (_req, res, s) => {
+          void s.streamFile('index.html', res, 'text/html; charset=utf-8', false, false, 502);
+        });
+
+        try {
+          const res = await executeRequest(testEnv.server, '/index.html', 'GET');
+          assert.equal(res.statusCode, 502);
+          assert.equal(res.body, 'Bad Gateway');
+
+          const errorDecision = decisions.find((d) => d.action === 'ErrorClassifier');
+          assert.ok(errorDecision);
+          assert.equal(errorDecision.choice, '502 Bad Gateway');
+          assert.equal(errorDecision['statusCode'], 502);
+        } finally {
+          await testEnv.close();
+        }
+      });
+
+      void it('should bypass recursive getFiles when direct key exists', async () => {
+        let getFilesCalled = false;
+        const files = new Map<string, MockFileOptions>([
+          [
+            'resume_cloudbuild/angular/main.js',
+            {
+              content: 'direct-content',
+              metadata: { etag: 'direct-etag', size: 14 },
+              emitResponseEvent: {
+                statusCode: 200,
+                headers: { etag: 'direct-etag', 'content-length': '14' },
+              },
+            },
+          ],
+        ]);
+
+        const mockBucket: Bucket = {
+          file: (name: string) => {
+            const opts = files.get(name) ?? { exists: false };
+            return createMockFile(opts, name);
+          },
+          getFiles: () => {
+            getFilesCalled = true;
+            return Promise.resolve([[], null]);
+          },
+        } as unknown as Bucket;
+
+        const customStorage = {
+          bucket: () => mockBucket,
+        } as unknown as Storage;
+
+        const service = new GcsStorageService(testConfig, customStorage);
+        const testEnv = await startTestServer(service, (_req, res, s) => {
+          void s.streamFile('main.js', res, 'application/javascript', false, false);
+        });
+
+        try {
+          const res = await executeRequest(testEnv.server, '/main.js', 'GET');
+          assert.equal(res.statusCode, 200);
+          assert.equal(res.body, 'direct-content');
+          assert.equal(getFilesCalled, false);
+        } finally {
+          await testEnv.close();
+        }
+      });
+
+      void it('should return 502 Bad Gateway and ErrorClassifier decision when direct exists() fails with 500/503 for GET and HEAD', async () => {
+        const { logger, decisions, logs } = createCapturingLogger();
+        const customFile = {
+          exists: () =>
+            Promise.reject(Object.assign(new Error('GCS 503 Service Unavailable'), { code: 503 })),
+        } as unknown as File;
+        const mockBucket = {
+          file: () => customFile,
+          getFiles: () => Promise.resolve([[], null]),
+        } as unknown as Bucket;
+        const storage = { bucket: () => mockBucket } as unknown as Storage;
+        const service = new GcsStorageService({
+          config: testConfig,
+          storageClient: storage,
+          logger,
+        });
+
+        const testEnv = await startTestServer(service, (req, res, s) => {
+          const isHead = req.method === 'HEAD';
+          void s.streamFile('styles.css', res, 'text/css', false, isHead);
+        });
+
+        try {
+          // GET
+          const getRes = await executeRequest(testEnv.server, '/styles.css', 'GET');
+          assert.equal(getRes.statusCode, 502);
+          assert.equal(getRes.body, 'Bad Gateway');
+
+          // HEAD
+          const headRes = await executeRequest(testEnv.server, '/styles.css', 'HEAD');
+          assert.equal(headRes.statusCode, 502);
+          assert.equal(headRes.body, '');
+
+          const errorDecisions = decisions.filter((d) => d.action === 'ErrorClassifier');
+          assert.equal(errorDecisions.length, 2);
+          assert.equal(errorDecisions[0]?.choice, '502 Bad Gateway');
+          assert.equal(errorDecisions[0]?.['is404'], false);
+          assert.equal(errorDecisions[1]?.choice, '502 Bad Gateway');
+          assert.equal(errorDecisions[1]?.['isHead'], true);
+          assert.equal(errorDecisions[1]?.['is404'], false);
+
+          const errorLogs = logs.filter((l) => l.level === 'error');
+          assert.equal(errorLogs.length, 2);
+        } finally {
+          await testEnv.close();
+        }
+      });
+
+      void it('should return 502 Bad Gateway when getFiles rejects with 403, 503, or listing 404 for GET, HEAD, and SPA fallback', async () => {
+        const errorScenarios = [
+          {
+            name: '403 Forbidden',
+            err: Object.assign(new Error('Caller does not have storage.objects.list permission'), {
+              code: 403,
+            }),
+          },
+          {
+            name: '503 Unavailable',
+            err: Object.assign(new Error('Service Unavailable'), { code: 503 }),
+          },
+          {
+            name: '404 Listing / Bucket Missing',
+            err: Object.assign(new Error('The specified bucket does not exist.'), { code: 404 }),
+          },
+          {
+            name: 'Generic 404 Listing',
+            err: Object.assign(new Error('Not Found'), { code: 404 }),
+          },
+        ];
+
+        for (const scenario of errorScenarios) {
+          const { logger, decisions } = createCapturingLogger();
+          const mockFile = { exists: () => Promise.resolve([false]) } as unknown as File;
+          const mockBucket = {
+            file: () => mockFile,
+            getFiles: () => Promise.reject(scenario.err),
+          } as unknown as Bucket;
+          const storage = { bucket: () => mockBucket } as unknown as Storage;
+          const service = new GcsStorageService({
+            config: testConfig,
+            storageClient: storage,
+            logger,
+          });
+
+          const testEnv = await startTestServer(service, (req, res, s) => {
+            const isHead = req.method === 'HEAD';
+            const isSpa = req.url === '/index.html';
+            const notFoundStatus = isSpa ? 502 : 404;
+            void s.streamFile(
+              isSpa ? 'index.html' : 'bundle.js',
+              res,
+              isSpa ? 'text/html' : 'application/javascript',
+              false,
+              isHead,
+              notFoundStatus,
+            );
+          });
+
+          try {
+            // GET regular missing asset
+            const getRes = await executeRequest(testEnv.server, '/bundle.js', 'GET');
+            assert.equal(getRes.statusCode, 502, `Expected 502 for ${scenario.name} GET`);
+            assert.equal(getRes.body, 'Bad Gateway');
+
+            // HEAD regular missing asset
+            const headRes = await executeRequest(testEnv.server, '/bundle.js', 'HEAD');
+            assert.equal(headRes.statusCode, 502, `Expected 502 for ${scenario.name} HEAD`);
+            assert.equal(headRes.body, '');
+
+            // SPA index.html fallback
+            const spaRes = await executeRequest(testEnv.server, '/index.html', 'GET');
+            assert.equal(spaRes.statusCode, 502, `Expected 502 for ${scenario.name} SPA fallback`);
+            assert.equal(spaRes.body, 'Bad Gateway');
+
+            const errorDecisions = decisions.filter((d) => d.action === 'ErrorClassifier');
+            assert.equal(
+              errorDecisions.length,
+              3,
+              `Expected 3 ErrorClassifier decisions for ${scenario.name}`,
+            );
+            for (const dec of errorDecisions) {
+              assert.equal(dec.choice, '502 Bad Gateway');
+              assert.equal(dec['statusCode'], 502);
+              assert.equal(
+                dec['is404'],
+                false,
+                `Expected is404=false for listing failure in ${scenario.name}`,
+              );
+            }
+          } finally {
+            await testEnv.close();
+          }
+        }
+      });
+
+      void it('should throw error from fileExists when getFiles rejects (never return false on listing failures)', async () => {
+        const errorScenarios = [
+          Object.assign(new Error('Permission denied'), { code: 403 }),
+          Object.assign(new Error('Backend 500 failure'), { code: 500 }),
+          Object.assign(new Error('Service Unavailable'), { code: 503 }),
+          Object.assign(new Error('Not Found'), { code: 404 }),
+        ];
+
+        for (const err of errorScenarios) {
+          const { logger, decisions, logs } = createCapturingLogger();
+          const mockFile = { exists: () => Promise.resolve([false]) } as unknown as File;
+          const mockBucket = {
+            file: () => mockFile,
+            getFiles: () => Promise.reject(err),
+          } as unknown as Bucket;
+          const storage = { bucket: () => mockBucket } as unknown as Storage;
+          const service = new GcsStorageService({
+            config: testConfig,
+            storageClient: storage,
+            logger,
+          });
+
+          await assert.rejects(
+            async () => {
+              await service.fileExists('check.js');
+            },
+            (thrown: unknown) => thrown === err,
+          );
+
+          const classifierDecisions = decisions.filter((d) => d.action === 'ErrorClassifier');
+          assert.equal(classifierDecisions.length, 1);
+          assert.equal(classifierDecisions[0]?.choice, '502 Bad Gateway');
+          assert.equal(classifierDecisions[0]?.['is404'], false);
+
+          const errorLogs = logs.filter((l) => l.level === 'error');
+          assert.equal(errorLogs.length, 1);
+          assert.equal(errorLogs[0]?.message, 'Storage error checking file existence');
+        }
+      });
     });
   });
 });

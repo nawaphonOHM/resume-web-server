@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -119,7 +119,7 @@ interface MockFileOptions {
  * @param options - Configuration options for stream payload, headers, metadata, and error conditions.
  * @returns A mocked {@link File} instance.
  */
-function createMockFile(options: MockFileOptions): File {
+function createMockFile(options: MockFileOptions, name = ''): File {
   const content = options.content ?? 'sample content';
   const metadata = {
     size: options.metadata?.size ?? Buffer.byteLength(content),
@@ -128,6 +128,7 @@ function createMockFile(options: MockFileOptions): File {
   };
 
   return {
+    name,
     exists: () => Promise.resolve([options.exists ?? true]),
     getMetadata: () => {
       if (options.errorOnMetadata) {
@@ -187,7 +188,18 @@ function createMockStorage(fileMap: Map<string, MockFileOptions>): Storage {
         errorOnMetadata: Object.assign(new Error(`No such object: ${name}`), { code: 404 }),
         exists: false,
       };
-      return createMockFile(opts);
+      return createMockFile(opts, name);
+    },
+    getFiles: (query?: { prefix?: string }) => {
+      const pfx = query?.prefix ?? '';
+      const matchedFiles: File[] = [];
+      for (const [name, opts] of fileMap.entries()) {
+        if (opts.exists === false) continue;
+        if (!pfx || name.startsWith(pfx)) {
+          matchedFiles.push(createMockFile(opts, name));
+        }
+      }
+      return Promise.resolve([matchedFiles, null]);
     },
   } as unknown as Bucket;
 
@@ -244,7 +256,11 @@ function performHttpRequest(
         port,
         path: options.path,
         method: options.method ?? 'GET',
-        headers: options.headers ?? {},
+        headers: {
+          connection: 'close',
+          ...(options.headers ?? {}),
+        },
+        agent: false,
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -295,9 +311,9 @@ void describe('HTTP Router & Request Handler', () => {
       assert.deepEqual(validateAndSanitizePath('/'), { valid: true, path: '/' });
       assert.deepEqual(validateAndSanitizePath('/health'), { valid: true, path: '/health' });
       assert.deepEqual(validateAndSanitizePath('/main.js'), { valid: true, path: '/main.js' });
-      assert.deepEqual(validateAndSanitizePath('/assets/logo.png'), {
+      assert.deepEqual(validateAndSanitizePath('/logo.png'), {
         valid: true,
-        path: '/assets/logo.png',
+        path: '/logo.png',
       });
       assert.deepEqual(validateAndSanitizePath('/about/team'), {
         valid: true,
@@ -340,9 +356,9 @@ void describe('HTTP Router & Request Handler', () => {
       assert.deepEqual(validateAndSanitizePath('health'), { valid: true, path: '/health' });
       assert.deepEqual(validateAndSanitizePath('main.js'), { valid: true, path: '/main.js' });
       assert.deepEqual(validateAndSanitizePath('//health'), { valid: true, path: '/health' });
-      assert.deepEqual(validateAndSanitizePath('///assets//logo.png'), {
+      assert.deepEqual(validateAndSanitizePath('///logo.png'), {
         valid: true,
-        path: '/assets/logo.png',
+        path: '/logo.png',
       });
     });
 
@@ -351,9 +367,9 @@ void describe('HTTP Router & Request Handler', () => {
         valid: true,
         path: '/health',
       });
-      assert.deepEqual(validateAndSanitizePath('https://example.com/assets/logo.png?v=1'), {
+      assert.deepEqual(validateAndSanitizePath('https://example.com/logo.png?v=1'), {
         valid: true,
-        path: '/assets/logo.png',
+        path: '/logo.png',
       });
       assert.deepEqual(validateAndSanitizePath('http://example.com'), {
         valid: true,
@@ -362,13 +378,184 @@ void describe('HTTP Router & Request Handler', () => {
     });
 
     void it('should decode valid percent-encoded characters in asset paths', () => {
-      assert.deepEqual(validateAndSanitizePath('/assets/my%20file.png'), {
+      assert.deepEqual(validateAndSanitizePath('/my%20file.png'), {
         valid: true,
-        path: '/assets/my file.png',
+        path: '/my file.png',
       });
-      assert.deepEqual(validateAndSanitizePath('/assets/%E4%BD%A0%E5%A5%BD.png'), {
+      assert.deepEqual(validateAndSanitizePath('/%E4%BD%A0%E5%A5%BD.png'), {
         valid: true,
-        path: '/assets/你好.png',
+        path: '/你好.png',
+      });
+    });
+
+    void it('should reject nested static asset paths', () => {
+      assert.equal(validateAndSanitizePath('/assets/logo.png').valid, false);
+      assert.equal(validateAndSanitizePath('/nested/styles.css').valid, false);
+      assert.equal(validateAndSanitizePath('/dist/browser/main.js').valid, false);
+      assert.equal(validateAndSanitizePath('/a/b/c/bundle.js').valid, false);
+      assert.equal(validateAndSanitizePath('/assets/sub/icon.svg').valid, false);
+      assert.equal(validateAndSanitizePath('/.well-known/security.txt').valid, false);
+      assert.equal(validateAndSanitizePath('/media/font-6G54T7R3.woff2').valid, false);
+    });
+
+    void it('should reject disallowed file extensions for single-level paths', () => {
+      assert.equal(validateAndSanitizePath('/app.exe').valid, false);
+      assert.equal(validateAndSanitizePath('/secret.php').valid, false);
+      assert.equal(validateAndSanitizePath('/config.env').valid, false);
+      assert.equal(validateAndSanitizePath('/backup.tar.gz').valid, false);
+      assert.equal(validateAndSanitizePath('/script.sh').valid, false);
+      assert.equal(validateAndSanitizePath('/test.py').valid, false);
+      assert.equal(validateAndSanitizePath('/secrets.yaml').valid, false);
+      assert.equal(validateAndSanitizePath('/data.bin').valid, false);
+    });
+
+    void it('should accept all standard single-level allowed extensions', () => {
+      assert.deepEqual(validateAndSanitizePath('/main.js'), { valid: true, path: '/main.js' });
+      assert.deepEqual(validateAndSanitizePath('/styles.css'), {
+        valid: true,
+        path: '/styles.css',
+      });
+      assert.deepEqual(validateAndSanitizePath('/index.html'), {
+        valid: true,
+        path: '/index.html',
+      });
+      assert.deepEqual(validateAndSanitizePath('/app.json'), { valid: true, path: '/app.json' });
+      assert.deepEqual(validateAndSanitizePath('/bundle.js.map'), {
+        valid: true,
+        path: '/bundle.js.map',
+      });
+      assert.deepEqual(validateAndSanitizePath('/manifest.webmanifest'), {
+        valid: true,
+        path: '/manifest.webmanifest',
+      });
+      assert.deepEqual(validateAndSanitizePath('/manifest.json'), {
+        valid: true,
+        path: '/manifest.json',
+      });
+      assert.deepEqual(validateAndSanitizePath('/favicon.ico'), {
+        valid: true,
+        path: '/favicon.ico',
+      });
+      assert.deepEqual(validateAndSanitizePath('/logo.svg'), { valid: true, path: '/logo.svg' });
+      assert.deepEqual(validateAndSanitizePath('/photo.jpg'), { valid: true, path: '/photo.jpg' });
+      assert.deepEqual(validateAndSanitizePath('/photo.webp'), {
+        valid: true,
+        path: '/photo.webp',
+      });
+      assert.deepEqual(validateAndSanitizePath('/photo.avif'), {
+        valid: true,
+        path: '/photo.avif',
+      });
+      assert.deepEqual(validateAndSanitizePath('/font.woff2'), {
+        valid: true,
+        path: '/font.woff2',
+      });
+      assert.deepEqual(validateAndSanitizePath('/font.woff'), { valid: true, path: '/font.woff' });
+      assert.deepEqual(validateAndSanitizePath('/module.wasm'), {
+        valid: true,
+        path: '/module.wasm',
+      });
+      assert.deepEqual(validateAndSanitizePath('/robots.txt'), {
+        valid: true,
+        path: '/robots.txt',
+      });
+      assert.deepEqual(validateAndSanitizePath('/sitemap.xml'), {
+        valid: true,
+        path: '/sitemap.xml',
+      });
+      assert.deepEqual(validateAndSanitizePath('/MAIN.JS'), { valid: true, path: '/MAIN.JS' });
+      assert.deepEqual(validateAndSanitizePath('/file.JS'), { valid: true, path: '/file.JS' });
+    });
+
+    void it('should preserve multi-level and nested HTML routes as SPA navigation routes', () => {
+      assert.deepEqual(validateAndSanitizePath('/about/page.html'), {
+        valid: true,
+        path: '/about/page.html',
+      });
+      assert.deepEqual(validateAndSanitizePath('/docs/index.html'), {
+        valid: true,
+        path: '/docs/index.html',
+      });
+      assert.deepEqual(validateAndSanitizePath('/docs/guide.htm'), {
+        valid: true,
+        path: '/docs/guide.htm',
+      });
+      assert.deepEqual(validateAndSanitizePath('/app.htm'), {
+        valid: true,
+        path: '/app.htm',
+      });
+    });
+
+    void it('should preserve dotted multi-level SPA navigation routes and dotfile directory paths', () => {
+      assert.deepEqual(validateAndSanitizePath('/user/john.doe'), {
+        valid: true,
+        path: '/user/john.doe',
+      });
+      assert.deepEqual(validateAndSanitizePath('/blog/post.1'), {
+        valid: true,
+        path: '/blog/post.1',
+      });
+      assert.deepEqual(validateAndSanitizePath('/v1.2/overview'), {
+        valid: true,
+        path: '/v1.2/overview',
+      });
+      assert.deepEqual(validateAndSanitizePath('/.git/config'), {
+        valid: true,
+        path: '/.git/config',
+      });
+      assert.deepEqual(validateAndSanitizePath('/sub/.hidden'), {
+        valid: true,
+        path: '/sub/.hidden',
+      });
+    });
+
+    void it('should handle trailing slashes and percent-encoded extensions on static assets', () => {
+      assert.deepEqual(validateAndSanitizePath('/main.js/'), {
+        valid: true,
+        path: '/main.js/',
+      });
+      assert.deepEqual(validateAndSanitizePath('/styles.css/'), {
+        valid: true,
+        path: '/styles.css/',
+      });
+      assert.deepEqual(validateAndSanitizePath('/main%2Ejs'), {
+        valid: true,
+        path: '/main.js',
+      });
+      assert.deepEqual(validateAndSanitizePath('/ma%69n.js'), {
+        valid: true,
+        path: '/main.js',
+      });
+      assert.deepEqual(validateAndSanitizePath('/main.%6As'), {
+        valid: true,
+        path: '/main.js',
+      });
+      assert.deepEqual(validateAndSanitizePath('/logo%2Epng'), {
+        valid: true,
+        path: '/logo.png',
+      });
+      assert.deepEqual(validateAndSanitizePath('/styles.%63%73%73'), {
+        valid: true,
+        path: '/styles.css',
+      });
+    });
+
+    void it('should preserve multi-level SPA navigation routes without extensions', () => {
+      assert.deepEqual(validateAndSanitizePath('/skills/frontend/angular'), {
+        valid: true,
+        path: '/skills/frontend/angular',
+      });
+      assert.deepEqual(validateAndSanitizePath('/dashboard/settings/profile'), {
+        valid: true,
+        path: '/dashboard/settings/profile',
+      });
+      assert.deepEqual(validateAndSanitizePath('/about/team'), {
+        valid: true,
+        path: '/about/team',
+      });
+      assert.deepEqual(validateAndSanitizePath('/experience'), {
+        valid: true,
+        path: '/experience',
       });
     });
 
@@ -643,9 +830,9 @@ void describe('HTTP Router & Request Handler', () => {
       });
 
       // Unhashed static asset
-      await router.handle({ method: 'GET', url: '/assets/logo.svg' } as IncomingMessage, dummyRes);
+      await router.handle({ method: 'GET', url: '/logo.svg' } as IncomingMessage, dummyRes);
       assert.deepEqual(streamCalls[1], {
-        objectName: 'assets/logo.svg',
+        objectName: 'logo.svg',
         contentType: 'image/svg+xml',
         isHashed: false,
         isHead: false,
@@ -793,6 +980,13 @@ void describe('HTTP Router & Request Handler', () => {
         {
           content: '<!DOCTYPE html><html><head><title>Resume</title></head><body>App</body></html>',
           metadata: { etag: '"index-etag-1"' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/main.js',
+        {
+          content: 'console.log("main bundle");',
+          metadata: { etag: '"main-plain-etag-1"' },
         },
       ],
       [
@@ -961,7 +1155,7 @@ void describe('HTTP Router & Request Handler', () => {
     void it('should return 404 for missing static assets without falling back to index.html', async () => {
       await startServer();
       try {
-        const res = await performHttpRequest(serverPort, { path: '/assets/non-existent.png' });
+        const res = await performHttpRequest(serverPort, { path: '/non-existent.png' });
         assert.equal(res.statusCode, 404);
         assert.equal(res.headers['content-type'], 'text/plain; charset=utf-8');
         assert.equal(res.headers['x-content-type-options'], 'nosniff');
@@ -1090,7 +1284,7 @@ void describe('HTTP Router & Request Handler', () => {
         assert.equal(headRes.body, '');
 
         // Static missing asset still returns 404 Not Found
-        const staticRes = await performHttpRequest(missingIndexPort, { path: '/assets/logo.png' });
+        const staticRes = await performHttpRequest(missingIndexPort, { path: '/logo.png' });
         assert.equal(staticRes.statusCode, 404);
         assert.equal(staticRes.headers['content-type'], 'text/plain; charset=utf-8');
         assert.equal(staticRes.body, 'Not Found');
@@ -1180,6 +1374,73 @@ void describe('HTTP Router & Request Handler', () => {
       } finally {
         await new Promise<void>((resolve) => {
           outageServer.close(() => {
+            resolve();
+          });
+        });
+      }
+    });
+
+    void it('should return 502 Bad Gateway when GCS getFiles listing fails on static asset or SPA requests', async () => {
+      const listingErrorStorage: Storage = {
+        bucket: () =>
+          ({
+            file: (name: string) => createMockFile({ exists: false }, name),
+            getFiles: () =>
+              Promise.reject(
+                Object.assign(new Error('Caller lacks storage.objects.list permission'), {
+                  code: 403,
+                }),
+              ),
+          }) as unknown as Bucket,
+      } as unknown as Storage;
+
+      const listingService = new GcsStorageService({
+        config: testConfig,
+        storageClient: listingErrorStorage,
+        logger: silentLogger,
+      });
+
+      let testServer: http.Server;
+      let testPort = 0;
+
+      await new Promise<void>((resolve) => {
+        const handler = createRouter({
+          storageService: listingService,
+          logger: silentLogger,
+        });
+        testServer = http.createServer((req, res) => {
+          void handler(req, res);
+        });
+        testServer.listen(0, '127.0.0.1', () => {
+          const addr = testServer.address() as AddressInfo;
+          testPort = addr.port;
+          resolve();
+        });
+      });
+
+      try {
+        // GET missing static asset when getFiles fails -> 502 (not 500 or 404)
+        const getAssetRes = await performHttpRequest(testPort, { path: '/main.js' });
+        assert.equal(getAssetRes.statusCode, 502);
+        assert.equal(getAssetRes.headers['content-type'], 'text/plain; charset=utf-8');
+        assert.equal(getAssetRes.body, 'Bad Gateway');
+
+        // HEAD missing static asset when getFiles fails -> 502
+        const headAssetRes = await performHttpRequest(testPort, {
+          path: '/main.js',
+          method: 'HEAD',
+        });
+        assert.equal(headAssetRes.statusCode, 502);
+        assert.equal(headAssetRes.body, '');
+
+        // GET SPA route when index.html missing and getFiles fails -> 502
+        const spaRes = await performHttpRequest(testPort, { path: '/' });
+        assert.equal(spaRes.statusCode, 502);
+        assert.equal(spaRes.headers['content-type'], 'text/plain; charset=utf-8');
+        assert.equal(spaRes.body, 'Bad Gateway');
+      } finally {
+        await new Promise<void>((resolve) => {
+          testServer.close(() => {
             resolve();
           });
         });
@@ -1317,6 +1578,119 @@ void describe('HTTP Router & Request Handler', () => {
       }
     });
 
+    void it('should reject nested static asset paths with 400 Bad Request in real HTTP server', async () => {
+      await startServer();
+      try {
+        const nestedPaths = [
+          '/assets/logo.png',
+          '/dist/browser/main.js',
+          '/sub/styles.css',
+          '/nested/deep/icon.svg',
+          '/static/manifest.json',
+          '/.well-known/security.txt',
+        ];
+        for (const nestedPath of nestedPaths) {
+          const res = await performHttpRequest(serverPort, { path: nestedPath });
+          assert.equal(res.statusCode, 400, `Expected 400 for nested static path ${nestedPath}`);
+          assert.equal(res.headers['content-type'], 'text/plain; charset=utf-8');
+          assert.equal(res.headers['x-content-type-options'], 'nosniff');
+          assert.equal(res.headers['x-frame-options'], 'SAMEORIGIN');
+          assert.equal(res.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+          assert.equal(res.body, 'Bad Request');
+        }
+      } finally {
+        await stopServer();
+      }
+    });
+
+    void it('should successfully serve /health, root /, and SPA routes with nested HTML / dotted paths in real HTTP server', async () => {
+      await startServer();
+      try {
+        // 1. Health check endpoint
+        const healthRes = await performHttpRequest(serverPort, { path: '/health' });
+        assert.equal(healthRes.statusCode, 200);
+        assert.equal(healthRes.headers['content-type'], 'application/json; charset=utf-8');
+        assert.equal(healthRes.headers['cache-control'], 'no-cache, no-store, must-revalidate');
+        assert.equal(healthRes.headers['x-content-type-options'], 'nosniff');
+        assert.equal(healthRes.headers['x-frame-options'], 'SAMEORIGIN');
+        assert.equal(healthRes.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+        const healthBody = JSON.parse(healthRes.body) as { status: string };
+        assert.equal(healthBody.status, 'UP');
+
+        // 2. Root route
+        const rootRes = await performHttpRequest(serverPort, { path: '/' });
+        assert.equal(rootRes.statusCode, 200);
+        assert.equal(rootRes.headers['content-type'], 'text/html; charset=utf-8');
+        assert.equal(rootRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+        assert.ok(rootRes.body.includes('<title>Resume</title>'));
+
+        // 3. Nested HTML routes (preserve SPA fallback)
+        const nestedHtmlPaths = ['/about/page.html', '/docs/index.html', '/guide.htm'];
+        for (const htmlPath of nestedHtmlPaths) {
+          const res = await performHttpRequest(serverPort, { path: htmlPath });
+          assert.equal(res.statusCode, 200, `Expected 200 for HTML route ${htmlPath}`);
+          assert.equal(res.headers['content-type'], 'text/html; charset=utf-8');
+          assert.ok(res.body.includes('<title>Resume</title>'));
+        }
+
+        // 4. Dotted SPA navigation routes
+        const dottedPaths = ['/user/john.doe', '/blog/post.1', '/v1.2/overview'];
+        for (const dottedPath of dottedPaths) {
+          const res = await performHttpRequest(serverPort, { path: dottedPath });
+          assert.equal(res.statusCode, 200, `Expected 200 for dotted SPA route ${dottedPath}`);
+          assert.equal(res.headers['content-type'], 'text/html; charset=utf-8');
+          assert.ok(res.body.includes('<title>Resume</title>'));
+        }
+      } finally {
+        await stopServer();
+      }
+    });
+
+    void it('should stream percent-encoded static asset paths in real HTTP server', async () => {
+      await startServer();
+      try {
+        const encodedPaths = ['/main%2Ejs', '/ma%69n.js', '/main.%6As'];
+        for (const encPath of encodedPaths) {
+          const res = await performHttpRequest(serverPort, { path: encPath });
+          assert.equal(res.statusCode, 200, `Expected 200 for encoded static path ${encPath}`);
+          assert.equal(res.headers['content-type'], 'application/javascript; charset=utf-8');
+          assert.equal(res.body, 'console.log("main bundle");');
+        }
+      } finally {
+        await stopServer();
+      }
+    });
+
+    void it('should reject disallowed file extensions with 400 Bad Request in real HTTP server', async () => {
+      await startServer();
+      try {
+        const disallowedPaths = [
+          '/malicious.exe',
+          '/secret.php',
+          '/config.env',
+          '/backup.tar.gz',
+          '/script.sh',
+          '/test.py',
+          '/app.yaml',
+        ];
+        for (const disallowedPath of disallowedPaths) {
+          const res = await performHttpRequest(serverPort, { path: disallowedPath });
+          assert.equal(
+            res.statusCode,
+            400,
+            `Expected 400 for disallowed extension path ${disallowedPath}`,
+          );
+          assert.equal(res.headers['content-type'], 'text/plain; charset=utf-8');
+          assert.equal(res.headers['x-content-type-options'], 'nosniff');
+          assert.equal(res.headers['x-frame-options'], 'SAMEORIGIN');
+          assert.equal(res.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+          assert.equal(res.body, 'Bad Request');
+        }
+      } finally {
+        await stopServer();
+      }
+    });
+
     void it('should verify SOLID Router components individually and with dependency injection', () => {
       const sanitizer = new DefenseInDepthPathSanitizer();
       assert.equal(sanitizer.validateAndSanitize('/test').valid, true);
@@ -1361,7 +1735,7 @@ void describe('HTTP Router & Request Handler', () => {
       const routerWithDeps = new Router({
         storageService: new GcsStorageService({
           config: testConfig,
-          storageClient: createMockStorage([]),
+          storageClient: createMockStorage(new Map()),
           logger: silentLogger,
         }),
         pathSanitizer: sanitizer,
@@ -1456,16 +1830,16 @@ void describe('HTTP Router & Request Handler', () => {
       const sanitizer = new DefenseInDepthPathSanitizer(logger);
 
       // Valid path normalization
-      const validRes = sanitizer.validateAndSanitize('/assets/main.js?query=123');
+      const validRes = sanitizer.validateAndSanitize('/main.js?query=123');
       assert.equal(validRes.valid, true);
-      assert.equal(validRes.path, '/assets/main.js');
+      assert.equal(validRes.path, '/main.js');
       assert.equal(decisions.length, 1);
       assert.deepEqual(decisions[0], {
         action: 'PathSanitizer',
-        choice: "normalize path to '/assets/main.js'",
+        choice: "normalize path to '/main.js'",
         reason: 'Path passed all security and traversal validation checks',
         level: 'debug',
-        path: '/assets/main.js',
+        path: '/main.js',
       });
 
       // Directory traversal rejection
@@ -1583,18 +1957,18 @@ void describe('HTTP Router & Request Handler', () => {
 
       // 1. Static hashed asset dispatch
       await router.handle(
-        { method: 'GET', url: '/assets/main-5T7P2N6K.js?v=1#hash' } as IncomingMessage,
+        { method: 'GET', url: '/main-5T7P2N6K.js?v=1#hash' } as IncomingMessage,
         fakeRes,
       );
       assert.equal(streamedFiles.length, 1);
-      assert.equal(streamedFiles[0]?.name, 'assets/main-5T7P2N6K.js');
+      assert.equal(streamedFiles[0]?.name, 'main-5T7P2N6K.js');
       assert.equal(streamedFiles[0]?.isHashed, true);
 
       const staticDecision = decisions.find(
         (d) => d.action === 'Router' && d.choice.startsWith('stream static asset'),
       );
       assert.ok(staticDecision);
-      assert.equal(staticDecision.choice, "stream static asset 'assets/main-5T7P2N6K.js'");
+      assert.equal(staticDecision.choice, "stream static asset 'main-5T7P2N6K.js'");
       assert.equal(staticDecision.contentType, 'application/javascript; charset=utf-8');
       assert.equal(staticDecision.isHashed, true);
       assert.equal(staticDecision.cacheControl, 'public, max-age=31536000, immutable');
@@ -2131,6 +2505,425 @@ void describe('HTTP Router & Request Handler', () => {
       const handledHead = handler.handle('health', fakeRes, true);
       assert.equal(handledHead, true);
       assert.ok(headers['content-length']);
+    });
+  });
+
+  /**
+   * End-to-end integration tests verifying multi-version recursive asset delivery,
+   * timestamp sorting (newest first), direct precedence, deeply nested artifacts,
+   * root prefix configuration, unversioned fallbacks, SPA routing, and GCS listing failures over real HTTP.
+   */
+  void describe('End-to-End Multi-Version Timestamped Asset Delivery Integration Tests', () => {
+    let multiVersionServer: http.Server;
+    let multiVersionPort: number;
+
+    const multiVersionFiles = new Map<string, MockFileOptions>([
+      // Multi-version deployments: v1 (old) vs v2 (new)
+      [
+        'resume_cloudbuild/angular/1710000000_v1/dist/browser/main.js',
+        {
+          content: 'console.log("v1-main");',
+          metadata: { etag: 'etag-v1-main' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1720000000_v2/dist/browser/main.js',
+        {
+          content: 'console.log("v2-main");',
+          metadata: { etag: 'etag-v2-main' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1715000000_v1.5/dist/browser/main.js',
+        {
+          content: 'console.log("v1.5-main");',
+          metadata: { etag: 'etag-v1.5-main' },
+        },
+      ],
+      // Multi-version index.html
+      [
+        'resume_cloudbuild/angular/1710000000_v1/dist/browser/index.html',
+        {
+          content:
+            '<!DOCTYPE html><html><head><title>Resume v1</title></head><body>V1 App</body></html>',
+          metadata: { etag: 'etag-v1-index' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1720000000_v2/dist/browser/index.html',
+        {
+          content:
+            '<!DOCTYPE html><html><head><title>Resume v2</title></head><body>V2 App</body></html>',
+          metadata: { etag: 'etag-v2-index' },
+        },
+      ],
+      // Direct vs nested collision: direct root file must take precedence over newer nested version
+      [
+        'resume_cloudbuild/angular/direct-precedence.js',
+        {
+          content: 'console.log("direct-root-hit");',
+          metadata: { etag: 'etag-direct-root' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1730000000_future/dist/browser/direct-precedence.js',
+        {
+          content: 'console.log("future-nested-shadowed");',
+          metadata: { etag: 'etag-future-nested' },
+        },
+      ],
+      // Deeply nested hashed and unhashed assets
+      [
+        'resume_cloudbuild/angular/1725000000_rel/dist/browser/nested/deep/artifacts/chunk-5T7P2N6K.js',
+        {
+          content: 'console.log("deep-chunk-hashed");',
+          metadata: { etag: 'etag-deep-chunk' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1725000000_rel/assets/deeply/nested/styles-5INURTSO.css',
+        {
+          content: 'body { color: blue; }',
+          metadata: { etag: 'etag-deep-css' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1725000000_rel/images/subfolder/logo.png',
+        {
+          content: 'binary-logo-data',
+          metadata: { etag: 'etag-logo-png' },
+        },
+      ],
+      // Non-timestamped / unversioned directory mixed with timestamped
+      [
+        'resume_cloudbuild/angular/unversioned_backup/common.js',
+        {
+          content: 'console.log("unversioned-common");',
+          metadata: { etag: 'etag-unversioned-common' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1720000000_v2/dist/common.js',
+        {
+          content: 'console.log("v2-common");',
+          metadata: { etag: 'etag-v2-common' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/dist_legacy/legacy-only.js',
+        {
+          content: 'console.log("legacy-only-content");',
+          metadata: { etag: 'etag-legacy-only' },
+        },
+      ],
+    ]);
+
+    const startMultiVersionServer = (): Promise<void> =>
+      new Promise((resolve) => {
+        const storageService = new GcsStorageService({
+          config: testConfig,
+          storageClient: createMockStorage(multiVersionFiles),
+          logger: silentLogger,
+        });
+        const handler = createRouter({ storageService, logger: silentLogger });
+        multiVersionServer = http.createServer((req, res) => {
+          void handler(req, res);
+        });
+        multiVersionServer.listen(0, '127.0.0.1', () => {
+          const addr = multiVersionServer.address() as AddressInfo;
+          multiVersionPort = addr.port;
+          resolve();
+        });
+      });
+
+    const stopMultiVersionServer = (): Promise<void> =>
+      new Promise((resolve) => {
+        multiVersionServer.closeAllConnections?.();
+        multiVersionServer.close(() => {
+          resolve();
+        });
+      });
+
+    before(async () => {
+      await startMultiVersionServer();
+    });
+
+    after(async () => {
+      await stopMultiVersionServer();
+    });
+
+    void it('should prioritize newest timestamped deployment when serving static assets over real HTTP GET and HEAD (multi-version)', async () => {
+      // GET /main.js
+      const getRes = await performHttpRequest(multiVersionPort, { path: '/main.js' });
+      assert.equal(getRes.statusCode, 200);
+      assert.equal(getRes.headers['content-type'], 'application/javascript; charset=utf-8');
+      assert.equal(getRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+      assert.equal(getRes.headers.etag, '"etag-v2-main"');
+      assert.equal(getRes.headers['content-length'], '23');
+      assert.equal(getRes.headers['x-content-type-options'], 'nosniff');
+      assert.equal(getRes.headers['x-frame-options'], 'SAMEORIGIN');
+      assert.equal(getRes.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+      assert.equal(getRes.body, 'console.log("v2-main");');
+
+      // HEAD /main.js
+      const headRes = await performHttpRequest(multiVersionPort, {
+        path: '/main.js',
+        method: 'HEAD',
+      });
+      assert.equal(headRes.statusCode, 200);
+      assert.equal(headRes.headers['content-type'], 'application/javascript; charset=utf-8');
+      assert.equal(headRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+      assert.equal(headRes.headers.etag, '"etag-v2-main"');
+      assert.equal(headRes.headers['content-length'], '23');
+      assert.equal(headRes.body, '');
+    });
+
+    void it('should prioritize direct root prefix file over newer timestamped deployments (direct precedence)', async () => {
+      // GET /direct-precedence.js
+      const getRes = await performHttpRequest(multiVersionPort, { path: '/direct-precedence.js' });
+      assert.equal(getRes.statusCode, 200);
+      assert.equal(getRes.headers['content-type'], 'application/javascript; charset=utf-8');
+      assert.equal(getRes.headers.etag, '"etag-direct-root"');
+      assert.equal(getRes.headers['content-length'], '31');
+      assert.equal(getRes.body, 'console.log("direct-root-hit");');
+
+      // HEAD /direct-precedence.js
+      const headRes = await performHttpRequest(multiVersionPort, {
+        path: '/direct-precedence.js',
+        method: 'HEAD',
+      });
+      assert.equal(headRes.statusCode, 200);
+      assert.equal(headRes.headers.etag, '"etag-direct-root"');
+      assert.equal(headRes.headers['content-length'], '31');
+      assert.equal(headRes.body, '');
+    });
+
+    void it('should locate and stream deeply nested hashed and unhashed assets in timestamped deployment directories', async () => {
+      // Deeply nested hashed JS asset -> immutable cache
+      const jsRes = await performHttpRequest(multiVersionPort, { path: '/chunk-5T7P2N6K.js' });
+      assert.equal(jsRes.statusCode, 200);
+      assert.equal(jsRes.headers['content-type'], 'application/javascript; charset=utf-8');
+      assert.equal(jsRes.headers['cache-control'], 'public, max-age=31536000, immutable');
+      assert.equal(jsRes.headers.etag, '"etag-deep-chunk"');
+      assert.equal(jsRes.headers['content-length'], '33');
+      assert.equal(jsRes.body, 'console.log("deep-chunk-hashed");');
+
+      // Deeply nested hashed CSS asset -> immutable cache
+      const cssRes = await performHttpRequest(multiVersionPort, { path: '/styles-5INURTSO.css' });
+      assert.equal(cssRes.statusCode, 200);
+      assert.equal(cssRes.headers['content-type'], 'text/css; charset=utf-8');
+      assert.equal(cssRes.headers['cache-control'], 'public, max-age=31536000, immutable');
+      assert.equal(cssRes.headers.etag, '"etag-deep-css"');
+      assert.equal(cssRes.headers['content-length'], '21');
+      assert.equal(cssRes.body, 'body { color: blue; }');
+
+      // Deeply nested unhashed image -> no-cache revalidate
+      const imgRes = await performHttpRequest(multiVersionPort, { path: '/logo.png' });
+      assert.equal(imgRes.statusCode, 200);
+      assert.equal(imgRes.headers['content-type'], 'image/png');
+      assert.equal(imgRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+      assert.equal(imgRes.headers.etag, '"etag-logo-png"');
+      assert.equal(imgRes.headers['content-length'], '16');
+      assert.equal(imgRes.body, 'binary-logo-data');
+    });
+
+    void it('should prioritize timestamped deployments over unversioned directories, but fallback to unversioned when no timestamped match exists', async () => {
+      // /common.js exists in both 1720000000_v2 and unversioned_backup -> selects 1720000000_v2
+      const commonRes = await performHttpRequest(multiVersionPort, { path: '/common.js' });
+      assert.equal(commonRes.statusCode, 200);
+      assert.equal(commonRes.headers.etag, '"etag-v2-common"');
+      assert.equal(commonRes.body, 'console.log("v2-common");');
+
+      // /legacy-only.js exists ONLY in dist_legacy -> falls back to unversioned folder
+      const legacyRes = await performHttpRequest(multiVersionPort, { path: '/legacy-only.js' });
+      assert.equal(legacyRes.statusCode, 200);
+      assert.equal(legacyRes.headers.etag, '"etag-legacy-only"');
+      assert.equal(legacyRes.body, 'console.log("legacy-only-content");');
+    });
+
+    void it('should route root / and SPA navigation to relocated index.html from newest timestamped deployment', async () => {
+      // GET / -> serves newest v2 index.html
+      const rootRes = await performHttpRequest(multiVersionPort, { path: '/' });
+      assert.equal(rootRes.statusCode, 200);
+      assert.equal(rootRes.headers['content-type'], 'text/html; charset=utf-8');
+      assert.equal(rootRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+      assert.equal(rootRes.headers.etag, '"etag-v2-index"');
+      assert.ok(rootRes.body.includes('<title>Resume v2</title>'));
+
+      // GET /experience -> serves newest v2 index.html
+      const navRes = await performHttpRequest(multiVersionPort, { path: '/experience' });
+      assert.equal(navRes.statusCode, 200);
+      assert.equal(navRes.headers['content-type'], 'text/html; charset=utf-8');
+      assert.equal(navRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+      assert.equal(navRes.headers.etag, '"etag-v2-index"');
+      assert.ok(navRes.body.includes('<title>Resume v2</title>'));
+
+      // HEAD /experience -> serves 200 with empty body and matching headers
+      const headNavRes = await performHttpRequest(multiVersionPort, {
+        path: '/experience',
+        method: 'HEAD',
+      });
+      assert.equal(headNavRes.statusCode, 200);
+      assert.equal(headNavRes.headers['content-type'], 'text/html; charset=utf-8');
+      assert.equal(headNavRes.headers['content-length'], '84');
+      assert.equal(headNavRes.headers.etag, '"etag-v2-index"');
+      assert.equal(headNavRes.body, '');
+    });
+
+    void it('should stream relocated assets and SPA fallback when GCS_PREFIX is configured as empty root', async () => {
+      const rootPrefixFiles = new Map<string, MockFileOptions>([
+        [
+          '1720000000_v2/dist/browser/app-bundle.js',
+          {
+            content: 'console.log("root-prefix-bundle");',
+            metadata: { etag: 'etag-root-bundle', size: 34 },
+          },
+        ],
+        [
+          '1720000000_v2/dist/browser/index.html',
+          {
+            content: '<!DOCTYPE html><html><title>Root Prefix Resume</title></html>',
+            metadata: { etag: 'etag-root-index', size: 61 },
+          },
+        ],
+      ]);
+
+      const rootPrefixStorage = new GcsStorageService({
+        config: { ...testConfig, prefix: '' },
+        storageClient: createMockStorage(rootPrefixFiles),
+        logger: silentLogger,
+      });
+
+      let rootServer: http.Server;
+      let rootPort = 0;
+
+      await new Promise<void>((resolve) => {
+        const handler = createRouter({ storageService: rootPrefixStorage, logger: silentLogger });
+        rootServer = http.createServer((req, res) => {
+          void handler(req, res);
+        });
+        rootServer.listen(0, '127.0.0.1', () => {
+          const addr = rootServer.address() as AddressInfo;
+          rootPort = addr.port;
+          resolve();
+        });
+      });
+
+      try {
+        // GET /app-bundle.js
+        const assetRes = await performHttpRequest(rootPort, { path: '/app-bundle.js' });
+        assert.equal(assetRes.statusCode, 200);
+        assert.equal(assetRes.headers['content-type'], 'application/javascript; charset=utf-8');
+        assert.equal(assetRes.headers.etag, '"etag-root-bundle"');
+        assert.equal(assetRes.body, 'console.log("root-prefix-bundle");');
+
+        // GET /dashboard (SPA route)
+        const spaRes = await performHttpRequest(rootPort, { path: '/dashboard' });
+        assert.equal(spaRes.statusCode, 200);
+        assert.equal(spaRes.headers['content-type'], 'text/html; charset=utf-8');
+        assert.ok(spaRes.body.includes('<title>Root Prefix Resume</title>'));
+      } finally {
+        await new Promise<void>((resolve) => {
+          rootServer.closeAllConnections?.();
+          rootServer.close(() => {
+            resolve();
+          });
+        });
+      }
+    });
+
+    void it('should return 404 Not Found for missing static assets without falling back to index.html', async () => {
+      // GET missing asset
+      const getRes = await performHttpRequest(multiVersionPort, { path: '/nonexistent-asset.js' });
+      assert.equal(getRes.statusCode, 404);
+      assert.equal(getRes.headers['content-type'], 'text/plain; charset=utf-8');
+      assert.equal(getRes.headers['x-content-type-options'], 'nosniff');
+      assert.equal(getRes.headers['x-frame-options'], 'SAMEORIGIN');
+      assert.equal(getRes.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+      assert.equal(getRes.body, 'Not Found');
+
+      // HEAD missing asset
+      const headRes = await performHttpRequest(multiVersionPort, {
+        path: '/nonexistent-asset.js',
+        method: 'HEAD',
+      });
+      assert.equal(headRes.statusCode, 404);
+      assert.equal(headRes.headers['content-type'], 'text/plain; charset=utf-8');
+      assert.equal(headRes.body, '');
+    });
+
+    void it('should return 502 Bad Gateway when recursive GCS listing fails on static asset requests and SPA fallback routes', async () => {
+      const failingListingStorage: Storage = {
+        bucket: () =>
+          ({
+            file: (name: string) => createMockFile({ exists: false }, name),
+            getFiles: () =>
+              Promise.reject(
+                Object.assign(new Error('Storage service unavailable'), { code: 503 }),
+              ),
+          }) as unknown as Bucket,
+      } as unknown as Storage;
+
+      const failingService = new GcsStorageService({
+        config: testConfig,
+        storageClient: failingListingStorage,
+        logger: silentLogger,
+      });
+
+      let failServer: http.Server;
+      let failPort = 0;
+
+      await new Promise<void>((resolve) => {
+        const handler = createRouter({ storageService: failingService, logger: silentLogger });
+        failServer = http.createServer((req, res) => {
+          void handler(req, res);
+        });
+        failServer.listen(0, '127.0.0.1', () => {
+          const addr = failServer.address() as AddressInfo;
+          failPort = addr.port;
+          resolve();
+        });
+      });
+
+      try {
+        // GET missing static asset when getFiles fails -> 502
+        const getAssetRes = await performHttpRequest(failPort, { path: '/bundle.js' });
+        assert.equal(getAssetRes.statusCode, 502);
+        assert.equal(getAssetRes.headers['content-type'], 'text/plain; charset=utf-8');
+        assert.equal(getAssetRes.headers['x-content-type-options'], 'nosniff');
+        assert.equal(getAssetRes.headers['x-frame-options'], 'SAMEORIGIN');
+        assert.equal(getAssetRes.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+        assert.equal(getAssetRes.body, 'Bad Gateway');
+
+        // HEAD missing static asset when getFiles fails -> 502
+        const headAssetRes = await performHttpRequest(failPort, {
+          path: '/bundle.js',
+          method: 'HEAD',
+        });
+        assert.equal(headAssetRes.statusCode, 502);
+        assert.equal(headAssetRes.body, '');
+
+        // GET SPA navigation route when index.html missing and getFiles fails -> 502
+        const getSpaRes = await performHttpRequest(failPort, { path: '/skills' });
+        assert.equal(getSpaRes.statusCode, 502);
+        assert.equal(getSpaRes.headers['content-type'], 'text/plain; charset=utf-8');
+        assert.equal(getSpaRes.body, 'Bad Gateway');
+
+        // HEAD SPA navigation route -> 502
+        const headSpaRes = await performHttpRequest(failPort, {
+          path: '/skills',
+          method: 'HEAD',
+        });
+        assert.equal(headSpaRes.statusCode, 502);
+        assert.equal(headSpaRes.body, '');
+      } finally {
+        await new Promise<void>((resolve) => {
+          failServer.closeAllConnections?.();
+          failServer.close(() => {
+            resolve();
+          });
+        });
+      }
     });
   });
 });

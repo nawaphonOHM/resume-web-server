@@ -27,6 +27,15 @@ function onInvalidPath(
   write400BadRequest(res);
 }
 
+/**
+ * Validates the incoming request URL, enforces single-level path parameters for static assets,
+ * checks allowed extensions via the configured path sanitizer, and returns the cleaned path.
+ *
+ * @param deps - Resolved router dependencies including path sanitizer and logger.
+ * @param req - Incoming HTTP request message.
+ * @param res - HTTP server response for writing error responses if validation fails.
+ * @returns Cleaned relative URL path if valid; `undefined` if validation failed and 400 was written.
+ */
 export function validateAndExtractPath(
   deps: ResolvedRouterDependencies,
   req: IncomingMessage,

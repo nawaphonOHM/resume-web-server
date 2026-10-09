@@ -5,7 +5,7 @@
  */
 
 import type { ServerResponse } from 'node:http';
-import type { Bucket, File } from '@google-cloud/storage';
+import type { File } from '@google-cloud/storage';
 import { HTTP_STATUS_NOT_FOUND } from '../http/http_status_codes.ts';
 import type { AppLogger } from '../logger/logger_types.ts';
 import { CACHE_CONTROL_IMMUTABLE, CACHE_CONTROL_NO_CACHE } from '../mime/mime.ts';
@@ -15,7 +15,7 @@ import { logStorageStreamDecision } from './storage_stream_telemetry.ts';
 import type { IEtagFormatter, IStorageErrorClassifier } from './storage_types.ts';
 
 export interface StreamDispatchContext {
-  readonly bucket: Bucket;
+  readonly file: File;
   readonly fullPath: string;
   readonly etagFormatter: IEtagFormatter;
   readonly errorClassifier: IStorageErrorClassifier;
@@ -60,7 +60,7 @@ function logDispatchDecision(ctx: StreamDispatchContext, p: StreamFileParams): v
 
 function streamIdentity(ctx: StreamDispatchContext, p: StreamFileParams) {
   return {
-    file: ctx.bucket.file(ctx.fullPath),
+    file: ctx.file,
     res: p.res,
     contentType: p.contentType,
     fullPath: ctx.fullPath,

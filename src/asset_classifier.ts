@@ -6,21 +6,20 @@
 
 import { extname } from 'node:path';
 import type { AppLogger } from './logger/logger.ts';
-import { type IAssetClassifier, HASHED_ASSET_REGEX } from './mime/mime_types.ts';
+import {
+  type IAssetClassifier,
+  HASHED_ASSET_REGEX,
+  KNOWN_STATIC_EXTENSIONS,
+} from './mime/mime_types.ts';
 
 const MUTABLE_PREFIXES = ['index.', 'ngsw', 'favicon', 'manifest', 'browserconfig'];
 
 function isStaticExtension(ext: string): boolean {
-  if (ext === '') {
-    return false;
-  }
-  return ext !== '.html' && ext !== '.htm';
+  return ext !== '' && KNOWN_STATIC_EXTENSIONS.has(ext.toLowerCase());
 }
 
 function getStaticReason(ext: string, isStatic: boolean): string {
-  if (isStatic) {
-    return `Path has non-HTML extension '${ext}'`;
-  }
+  if (isStatic) return `Path has non-HTML extension '${ext}'`;
   return ext === '' ? 'Path is extensionless' : `Path has HTML extension '${ext}'`;
 }
 
@@ -32,52 +31,35 @@ function isWellKnownMutableAsset(baseName: string): boolean {
   return MUTABLE_PREFIXES.some((prefix) => baseName.startsWith(prefix));
 }
 
-function getHashedReason(baseName: string, matched: boolean): string {
-  if (matched) {
-    return `Asset '${baseName}' matched content-hash regex pattern`;
-  }
-  return `Asset '${baseName}' does not match content-hash regex pattern`;
-}
-
-function getHashedChoice(matched: boolean): string {
-  return matched ? 'content-hashed asset' : 'unhashed asset';
-}
-
 function makeStaticPayload(filePath: string, ext: string, isStatic: boolean) {
-  const meta = { filePath, extension: ext };
   return {
     action: 'AssetClassifier' as const,
     choice: isStatic ? 'static asset' : 'SPA navigation route / HTML',
     reason: getStaticReason(ext, isStatic),
     level: 'debug' as const,
-    ...meta,
+    filePath,
+    extension: ext,
   };
 }
 
-function getMutableReason(baseName: string): string {
-  return `Asset '${baseName}' is a well-known mutable/root configuration file`;
-}
-
 function makeMutablePayload(filePath: string, baseName: string) {
-  const meta = { filePath, baseName, isHashed: false };
+  const meta = { filePath, baseName, isHashed: false, level: 'debug' as const };
+  const reason = `Asset '${baseName}' is a well-known mutable/root configuration file`;
   return {
     action: 'AssetClassifier' as const,
     choice: 'mutable asset (unhashed)',
-    reason: getMutableReason(baseName),
-    level: 'debug' as const,
+    reason,
     ...meta,
   };
 }
 
 function makeHashedPayload(filePath: string, baseName: string, matched: boolean) {
-  const meta = { filePath, baseName, isHashed: matched };
-  return {
-    action: 'AssetClassifier' as const,
-    choice: getHashedChoice(matched),
-    reason: getHashedReason(baseName, matched),
-    level: 'debug' as const,
-    ...meta,
-  };
+  const meta = { filePath, baseName, isHashed: matched, level: 'debug' as const };
+  const choice = matched ? 'content-hashed asset' : 'unhashed asset';
+  const reason = matched
+    ? `Asset '${baseName}' matched content-hash regex pattern`
+    : `Asset '${baseName}' does not match content-hash regex pattern`;
+  return { action: 'AssetClassifier' as const, choice, reason, ...meta };
 }
 
 /**

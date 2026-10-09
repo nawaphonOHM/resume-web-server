@@ -6,6 +6,11 @@
 
 import type { AppLogger } from '../logger/logger_types.ts';
 
+export {
+  type StorageLocateDecisionInfo,
+  logStorageLocateDecision,
+} from './storage_locate_telemetry.ts';
+
 export interface StorageStreamDecisionInfo {
   readonly objectName: string;
   readonly fullPath: string;

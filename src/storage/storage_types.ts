@@ -5,7 +5,7 @@
  */
 
 import type { ServerResponse } from 'node:http';
-import type { Storage } from '@google-cloud/storage';
+import type { Bucket, File, Storage } from '@google-cloud/storage';
 import type { ServerConfig } from '../config/config_types.ts';
 import type { AppLogger } from '../logger/logger_types.ts';
 
@@ -88,6 +88,71 @@ export interface IStorageErrorClassifier {
 }
 
 /**
+ * Represents a matched candidate file discovered during bucket search under a prefix.
+ */
+export interface CandidateFileMatch {
+  /**
+   * The GCS File handle.
+   */
+  readonly file: File;
+
+  /**
+   * Fully qualified GCS object path/name.
+   */
+  readonly fullPath: string;
+
+  /**
+   * Extracted unix timestamp from the first-level deployment directory, or null if unversioned.
+   */
+  readonly unixtime: number | null;
+
+  /**
+   * Name of the first-level directory segment under prefix, or empty string if at root.
+   */
+  readonly directoryName: string;
+}
+
+/**
+ * Result of locating a storage object via direct lookup or recursive search.
+ */
+export interface LocateResult {
+  /**
+   * The resolved GCS File handle.
+   */
+  readonly file: File;
+
+  /**
+   * Fully qualified GCS object path.
+   */
+  readonly fullPath: string;
+
+  /**
+   * Strategy used to locate the object ('direct' or 'recursive').
+   */
+  readonly strategy: 'direct' | 'recursive';
+
+  /**
+   * Extracted unix timestamp if resolved recursively from a timestamped directory.
+   */
+  readonly unixtime?: number;
+}
+
+/**
+ * Contract for locating objects in Google Cloud Storage via direct lookup or recursive search (Interface Segregation Principle).
+ */
+export interface IStorageObjectLocator {
+  /**
+   * Locates a file by relative object name, attempting direct lookup first and falling back to recursive listing under prefix.
+   *
+   * @param bucket - The GCS Bucket instance to search within.
+   * @param objectName - The relative asset filename / path.
+   * @param prefix - The configured bucket prefix string.
+   * @returns A promise resolving to the {@link LocateResult} if found, or `null` if not found.
+   */
+  locateFile(bucket: Bucket, objectName: string, prefix: string): Promise<LocateResult | null>;
+}
+
+/**
  * Service contract for interacting with object storage and streaming static assets (Interface Segregation Principle).
  */
 export interface StorageService
@@ -121,6 +186,11 @@ export interface StorageServiceOptions {
    * Custom error classification strategy.
    */
   readonly errorClassifier?: IStorageErrorClassifier;
+
+  /**
+   * Custom storage object locator strategy.
+   */
+  readonly locator?: IStorageObjectLocator;
 
   /**
    * Application logger for recording operational decisions and error traces.

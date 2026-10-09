@@ -9,8 +9,8 @@ import { HTTP_STATUS_BAD_REQUEST } from '../http/http_status_codes.ts';
 import type { AppLogger, DecisionLogPayload } from '../logger/logger_types.ts';
 import {
   checkDecodedPath,
+  checkNormalizedSecurity,
   checkRawPathSecurity,
-  checkRootEscape,
   stripSchemeAndHost,
 } from './path_security_checks.ts';
 import type { IPathSanitizer, PathValidationResult } from '../router/router_types.ts';
@@ -49,9 +49,8 @@ function runDecodedValidation(decoded: string): string | { normalized: string } 
   const err = checkDecodedPath(decoded);
   if (err) return err;
   const normalized = normalizePath(decoded);
-  const escapeErr = checkRootEscape(normalized);
-  if (escapeErr) return escapeErr;
-  return { normalized };
+  const normErr = checkNormalizedSecurity(normalized);
+  return normErr ?? { normalized };
 }
 
 function isNonEmptyUrl(url: string | undefined): url is string {
@@ -88,6 +87,8 @@ function runValidationPipeline(rawUrl: string): string | { normalized: string } 
  * 9. Safe URI decoding with malformed percent-encoding trap.
  * 10. Decoded null byte and control character inspection.
  * 11. POSIX path normalization and root-escape verification.
+ * 12. Single-level path parameter enforcement for static assets.
+ * 13. Allowed static file extension validation.
  */
 export class DefenseInDepthPathSanitizer implements IPathSanitizer {
   private readonly logger?: AppLogger;
@@ -144,8 +145,8 @@ export const defaultPathSanitizer = new DefenseInDepthPathSanitizer();
  *
  * @example
  * ```ts
- * validateAndSanitizePath('/styles/main.css'); // { valid: true, path: '/styles/main.css' }
- * validateAndSanitizePath('/../etc/passwd');     // { valid: false, path: '', error: '...' }
+ * validateAndSanitizePath('/main.css');      // { valid: true, path: '/main.css' }
+ * validateAndSanitizePath('/../etc/passwd'); // { valid: false, path: '', error: '...' }
  * ```
  */
 export function validateAndSanitizePath(rawUrl: string | undefined): PathValidationResult {

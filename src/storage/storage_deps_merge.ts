@@ -10,6 +10,7 @@ import type {
   IEtagFormatter,
   IStorageErrorClassifier,
   IStorageKeyResolver,
+  IStorageObjectLocator,
   StorageServiceOptions,
 } from './storage_types.ts';
 
@@ -18,6 +19,7 @@ export type RestStorageDeps = [
   IEtagFormatter?,
   IStorageErrorClassifier?,
   AppLogger?,
+  IStorageObjectLocator?,
 ];
 
 export interface RawStorageDeps {
@@ -26,21 +28,19 @@ export interface RawStorageDeps {
   readonly etagFormatter?: IEtagFormatter;
   readonly errorClassifier?: IStorageErrorClassifier;
   readonly logger?: AppLogger;
+  readonly locator?: IStorageObjectLocator;
 }
 
 function mergeField<T>(optionValue: T | undefined, positional: T | undefined): T | undefined {
   return optionValue ?? positional;
 }
 
-function mergeClientFields(
-  opts: StorageServiceOptions,
-  positional: RawStorageDeps,
-): RawStorageDeps {
-  return {
-    storageClient: mergeField(opts.storageClient, positional.storageClient),
-    pathResolver: mergeField(opts.pathResolver, positional.pathResolver),
-    etagFormatter: mergeField(opts.etagFormatter, positional.etagFormatter),
-  };
+function mergeClientFields(opts: StorageServiceOptions, pos: RawStorageDeps): RawStorageDeps {
+  const storageClient = mergeField(opts.storageClient, pos.storageClient);
+  const pathResolver = mergeField(opts.pathResolver, pos.pathResolver);
+  const etagFormatter = mergeField(opts.etagFormatter, pos.etagFormatter);
+  const locator = mergeField(opts.locator, pos.locator);
+  return { storageClient, pathResolver, etagFormatter, locator };
 }
 
 function mergeOptionFields(
@@ -58,8 +58,8 @@ export function extractRestDeps(
   client: Storage | undefined,
   rest: RestStorageDeps,
 ): RawStorageDeps {
-  const [pathResolver, etagFormatter, errorClassifier, logger] = rest;
-  return { storageClient: client, pathResolver, etagFormatter, errorClassifier, logger };
+  const [pathResolver, etagFormatter, errorClassifier, logger, locator] = rest;
+  return { storageClient: client, pathResolver, etagFormatter, errorClassifier, logger, locator };
 }
 
 export function mergeDeps(
