@@ -100,7 +100,7 @@ export function handleHeadStorageError(ctx: StorageErrorContext): void {
 
 export function handleGetStorageError(ctx: StorageErrorContext): void {
   const is404 = classify(ctx);
-  if (ctx.res.headersSent) {
+  if (!isResponseWritable(ctx.res)) {
     respondAborted(ctx, is404);
     return;
   }

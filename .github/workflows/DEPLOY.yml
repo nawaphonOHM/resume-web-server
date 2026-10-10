@@ -52,11 +52,17 @@ jobs:
           sed -i "s|_LOCATION_|$LOCATION|g" cloudbuild.yaml
           sed -i "s|_REPO_NAME_|$REPO_NAME|g" cloudbuild.yaml
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '22' }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
       - name: Compile TypeScript
         run: npm run compile
-
-      - name: move Compiled TypeScript out One level
-        run: mv ./dist/* .
 
       - name: Submit Cloud Build
         env:

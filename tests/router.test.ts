@@ -1949,6 +1949,30 @@ void describe('HTTP Router & Request Handler', () => {
       assert.equal(healthHandler.handle('health', fakeHealthRes, false), true);
       assert.equal(healthHandled, true);
 
+      // Verify writability guards
+      let unwritable405 = false;
+      const unwritableRes = {
+        headersSent: true,
+        end() {
+          unwritable405 = true;
+        },
+      } as unknown as ServerResponse;
+      assert.equal(
+        validator.validate({ method: 'DELETE' } as IncomingMessage, unwritableRes),
+        false,
+      );
+      assert.equal(unwritable405, false);
+
+      let unwritableHealth = false;
+      const unwritableHealthRes = {
+        destroyed: true,
+        end() {
+          unwritableHealth = true;
+        },
+      } as unknown as ServerResponse;
+      assert.equal(healthHandler.handle('health', unwritableHealthRes, false), true);
+      assert.equal(unwritableHealth, false);
+
       // Router DI constructor
       const routerWithDeps = new Router({
         storageService: new GcsStorageService({

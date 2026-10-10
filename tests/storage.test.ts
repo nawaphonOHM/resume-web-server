@@ -23,6 +23,11 @@ import {
   type IStorageObjectLocator,
   type CandidateFileMatch,
 } from '../src/storage/storage.ts';
+import {
+  handleGetStorageError,
+  handleHeadStorageError,
+} from '../src/storage/storage_error_responder.ts';
+import { destroyIfWritable, sendErrorPayload } from '../src/storage/storage_error_write.ts';
 import type { ServerConfig } from '../src/config/config.ts';
 import { createAppLogger, type AppLogger, type DecisionLogPayload } from '../src/logger/logger.ts';
 import winston from 'winston';
@@ -188,7 +193,7 @@ function createMockFile(options: MockFileOptions, name = 'test-file'): File {
 
       const rawHeaders = options.emitResponseEvent?.headers;
       const isCompressed = rawHeaders?.['content-encoding'] === 'gzip';
-      const shouldDecompress = isCompressed && (streamOptions?.decompress !== false);
+      const shouldDecompress = isCompressed && streamOptions?.decompress !== false;
 
       let stream: Readable;
 
@@ -729,7 +734,8 @@ void describe('GCS Storage Service', () => {
     });
 
     void it('should model SDK auto-decompression and exact-match semantics for gzip streams', async () => {
-      const decompressedBody = 'function main() { console.log("real-gcs-decompressed-stream-body"); }';
+      const decompressedBody =
+        'function main() { console.log("real-gcs-decompressed-stream-body"); }';
       const gzippedBytes = zlib.gzipSync(Buffer.from(decompressedBody, 'utf-8'));
       const files = new Map<string, MockFileOptions>([
         [
@@ -3710,6 +3716,197 @@ void describe('GCS Storage Service', () => {
           assert.equal(errorLogs[0]?.message, 'Storage error checking file existence');
         }
       });
+    });
+  });
+
+  void describe('Storage Error Response Writers & Handlers', () => {
+    void it('should correctly format error bodies for 404, 500, and 502 status codes', () => {
+      const recorded: { status: number; headers: Record<string, string>; body: string }[] = [];
+      const createMockRes = () => {
+        const headers: Record<string, string> = {};
+        let body = '';
+        let status = 200;
+        return {
+          headersSent: false,
+          destroyed: false,
+          writableEnded: false,
+          set statusCode(code: number) {
+            status = code;
+          },
+          get statusCode() {
+            return status;
+          },
+          setHeader(k: string, v: string) {
+            headers[k.toLowerCase()] = v;
+          },
+          removeHeader(k: string) {
+            delete headers[k.toLowerCase()];
+          },
+          end(payload?: string) {
+            body = payload ?? '';
+            recorded.push({ status, headers, body });
+          },
+        } as unknown as http.ServerResponse;
+      };
+
+      // 404
+      sendErrorPayload(createMockRes(), 404);
+      assert.equal(recorded[0]?.status, 404);
+      assert.equal(recorded[0]?.body, 'Not Found');
+
+      // 500
+      sendErrorPayload(createMockRes(), 500);
+      assert.equal(recorded[1]?.status, 500);
+      assert.equal(recorded[1]?.body, 'Internal Server Error');
+
+      // 502
+      sendErrorPayload(createMockRes(), 502);
+      assert.equal(recorded[2]?.status, 502);
+      assert.equal(recorded[2]?.body, 'Bad Gateway');
+    });
+
+    void it('should no-op when response is not writable in sendErrorPayload', () => {
+      let ended = false;
+      const fakeRes = {
+        headersSent: true,
+        destroyed: false,
+        writableEnded: false,
+        end() {
+          ended = true;
+        },
+      } as unknown as http.ServerResponse;
+
+      sendErrorPayload(fakeRes, 500);
+      assert.equal(ended, false);
+    });
+
+    void it('should handle non-writable responses gracefully in handleGetStorageError and handleHeadStorageError', () => {
+      const { logger, logs, decisions } = createCapturingLogger();
+      let destroyCalls = 0;
+      let setHeaderCalls = 0;
+      let endCalls = 0;
+      const fakeEndedRes = {
+        headersSent: false,
+        destroyed: false,
+        writableEnded: true,
+        statusCode: 200,
+        destroy() {
+          destroyCalls++;
+        },
+        setHeader() {
+          setHeaderCalls++;
+        },
+        end() {
+          endCalls++;
+        },
+      } as unknown as http.ServerResponse;
+
+      const getContext = {
+        err: new Error('Simulated get read failure'),
+        res: fakeEndedRes,
+        fullPath: 'test-get.js',
+        errorClassifier: new GcsErrorClassifier(),
+        logger,
+      };
+
+      handleGetStorageError(getContext);
+      assert.equal(destroyCalls, 0, 'destroy() must not be called when writableEnded is true');
+      assert.equal(setHeaderCalls, 0);
+      assert.equal(endCalls, 0);
+
+      const headContext = {
+        err: new Error('Simulated head read failure'),
+        res: fakeEndedRes,
+        fullPath: 'test-head.js',
+        errorClassifier: new GcsErrorClassifier(),
+        logger,
+        isHead: true,
+      };
+
+      handleHeadStorageError(headContext);
+      assert.equal(destroyCalls, 0, 'destroy() must not be called when writableEnded is true');
+      assert.equal(setHeaderCalls, 0);
+      assert.equal(endCalls, 0);
+
+      const errorLogs = logs.filter((l) => l.level === 'error');
+      assert.equal(errorLogs.length, 2);
+      assert.match(
+        String(errorLogs[0]?.message),
+        /Failed to stream asset from storage \(connection aborted mid-stream\)/,
+      );
+      assert.match(
+        String(errorLogs[1]?.message),
+        /Failed to retrieve metadata for asset from storage \(connection aborted mid-stream\)/,
+      );
+
+      const classifierDecisions = decisions.filter((d) => d.action === 'ErrorClassifier');
+      assert.equal(classifierDecisions.length, 2);
+      assert.equal(classifierDecisions[0]?.choice, '502 Bad Gateway');
+      assert.equal(classifierDecisions[1]?.choice, '502 Bad Gateway');
+    });
+
+    void it('should destroy live connection and omit body payload when headers were already sent', () => {
+      const { logger, logs, decisions } = createCapturingLogger();
+      let destroyCalls = 0;
+      let setHeaderCalls = 0;
+      let endCalls = 0;
+      const fakeLiveMidStreamRes = {
+        headersSent: true,
+        destroyed: false,
+        writableEnded: false,
+        statusCode: 200,
+        destroy() {
+          destroyCalls++;
+        },
+        setHeader() {
+          setHeaderCalls++;
+        },
+        end() {
+          endCalls++;
+        },
+      } as unknown as http.ServerResponse;
+
+      const getContext = {
+        err: new Error('Simulated mid-stream socket abort'),
+        res: fakeLiveMidStreamRes,
+        fullPath: 'test-stream.js',
+        errorClassifier: new GcsErrorClassifier(),
+        logger,
+      };
+
+      handleGetStorageError(getContext);
+      assert.equal(destroyCalls, 1, 'destroy() must be called to tear down mid-stream socket');
+      assert.equal(setHeaderCalls, 0, 'headers must not be written after headersSent');
+      assert.equal(endCalls, 0, 'payload must not be written to aborted stream');
+
+      const errorLogs = logs.filter((l) => l.level === 'error');
+      assert.equal(errorLogs.length, 1);
+      assert.match(
+        String(errorLogs[0]?.message),
+        /Failed to stream asset from storage \(connection aborted mid-stream\)/,
+      );
+
+      const classifierDecisions = decisions.filter((d) => d.action === 'ErrorClassifier');
+      assert.equal(classifierDecisions.length, 1);
+      assert.equal(
+        classifierDecisions[0]?.choice,
+        'abort connection (headers already sent, status 200)',
+      );
+      assert.equal(classifierDecisions[0]?.['headersSent'], true);
+    });
+
+    void it('should destroy writable response in destroyIfWritable', () => {
+      let destroyed = false;
+      const fakeRes = {
+        destroyed: false,
+        writableEnded: false,
+        destroy() {
+          destroyed = true;
+        },
+      } as unknown as http.ServerResponse;
+
+      destroyIfWritable(fakeRes);
+      assert.equal(destroyed, true);
     });
   });
 });

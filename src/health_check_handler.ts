@@ -6,6 +6,7 @@
 
 import { Buffer } from 'node:buffer';
 import type { ServerResponse } from 'node:http';
+import { isResponseWritable } from './http/http_response_state.ts';
 import { HTTP_STATUS_OK } from './http/http_status_codes.ts';
 import type { AppLogger, DecisionLogPayload } from './logger/logger_types.ts';
 import type {
@@ -50,6 +51,7 @@ function writeHeaders(res: ServerResponse, len: number): void {
 }
 
 function writeHealthResponse(res: ServerResponse, json: string, isHead: boolean): void {
+  if (!isResponseWritable(res)) return;
   writeHeaders(res, Buffer.byteLength(json));
   if (isHead) res.end();
   else res.end(json);
