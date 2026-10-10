@@ -87,8 +87,7 @@ function runValidationPipeline(rawUrl: string): string | { normalized: string } 
  * 9. Safe URI decoding with malformed percent-encoding trap.
  * 10. Decoded null byte and control character inspection.
  * 11. POSIX path normalization and root-escape verification.
- * 12. Single-level path parameter enforcement for static assets.
- * 13. Allowed static file extension validation.
+ * 12. Allowed static file extension validation across all single-level and nested paths.
  */
 export class DefenseInDepthPathSanitizer implements IPathSanitizer {
   private readonly logger?: AppLogger;

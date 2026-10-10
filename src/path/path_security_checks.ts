@@ -5,13 +5,7 @@
  */
 
 import { extname } from 'node:path';
-import {
-  ALLOWED_STATIC_EXTENSIONS,
-  KNOWN_HTML_EXTENSIONS,
-  KNOWN_STATIC_EXTENSIONS,
-} from '../mime/mime_types.ts';
-
-export { ALLOWED_STATIC_EXTENSIONS, KNOWN_HTML_EXTENSIONS, KNOWN_STATIC_EXTENSIONS };
+import { ALLOWED_STATIC_EXTENSIONS } from '../mime/mime_types.ts';
 
 const DOT_DOT_REGEX = /\.\.|%2e%2e|%2e\.|\.%2e/i;
 const ILLEGAL_DECODED_REGEX = /\0|\\|\.\./;
@@ -72,63 +66,27 @@ export function isAllowedExtension(ext: string): boolean {
   return ALLOWED_STATIC_EXTENSIONS.has(ext.toLowerCase());
 }
 
-export function isKnownStaticExtension(ext: string): boolean {
-  return KNOWN_STATIC_EXTENSIONS.has(ext.toLowerCase());
-}
-
-export function isHtmlExtension(ext: string): boolean {
-  return KNOWN_HTML_EXTENSIONS.has(ext.toLowerCase());
-}
-
-function isNestedPath(normalized: string): boolean {
-  return normalized.replace(/^\/+|\/+$/g, '').includes('/');
-}
-
-/**
- * Validates that static asset requests target a single-level path parameter (`/{pathParam}`).
- *
- * @remarks
- * If the path has a known static file extension (e.g., `.js`, `.css`, `.png`), it must not contain
- * nested directory slashes. HTML navigation routes (`.html`, `.htm`) and extensionless SPA paths
- * are permitted to have nested segments.
- */
-export function checkSingleLevelStaticPath(normalized: string): string | undefined {
-  const ext = extname(normalized).toLowerCase();
-  if (isKnownStaticExtension(ext) && isNestedPath(normalized)) {
-    return 'Static asset requests must target a single-level path parameter';
-  }
-  return undefined;
-}
-
 const EXTENSION_PATTERN = /^\.[a-z0-9_.-]+$/i;
-
-function isDisallowedSingleLevel(normalized: string, ext: string): boolean {
-  return !isNestedPath(normalized) && !isAllowedExtension(ext);
-}
 
 function isTargetExtension(ext: string): boolean {
   return ext !== '' && EXTENSION_PATTERN.test(ext);
 }
 
 /**
- * Validates file extensions for single-level asset requests against allowed static types (`MIME_TYPES`).
+ * Validates file extensions for asset requests against allowed static types (`MIME_TYPES`).
  *
  * @remarks
- * Rejects single-level files with unsupported extensions (e.g. `.exe`, `.php`, `.env`, `.tar.gz`).
- * Multi-level paths with non-static extensions (e.g., `/user/john.doe`) are treated as SPA navigation routes.
+ * Rejects requests with unsupported extensions (e.g. `.exe`, `.php`, `.env`, `.tar.gz`)
+ * across both single-level and nested paths.
  */
 export function checkAllowedExtension(normalized: string): string | undefined {
   const ext = extname(normalized).toLowerCase();
-  if (isTargetExtension(ext) && isDisallowedSingleLevel(normalized, ext)) {
+  if (isTargetExtension(ext) && !isAllowedExtension(ext)) {
     return `Disallowed file extension '${ext}'`;
   }
   return undefined;
 }
 
 export function checkNormalizedSecurity(normalized: string): string | undefined {
-  return (
-    checkRootEscape(normalized) ??
-    checkSingleLevelStaticPath(normalized) ??
-    checkAllowedExtension(normalized)
-  );
+  return checkRootEscape(normalized) ?? checkAllowedExtension(normalized);
 }
