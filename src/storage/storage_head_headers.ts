@@ -1,6 +1,31 @@
 /**
  * HEAD response header application and ETag telemetry for storage metadata.
  *
+ * @remarks
+ * ## RFC 9110 §9.3.2 HEAD Response Header Parity with GET
+ *
+ * The HTTP HEAD method requests metadata identical to what would have been delivered in
+ * a 200 (OK) response to an equivalent GET request (RFC 9110 §9.3.2 recommendation).
+ *
+ * When querying metadata from Google Cloud Storage via `file.getMetadata()`, GCS returns the
+ * stored object metadata (e.g., `metadata.size` indicating the stored compressed byte count,
+ * `metadata.contentEncoding`). Unlike `file.createReadStream()` with default `decompress: true`,
+ * `file.getMetadata()` does not download or stream payload bytes.
+ *
+ * However, to maintain strict header parity with GET responses under RFC 9110 §9.3.2:
+ * 1. **Content-Length & Content-Encoding Omission**: Because a GET request for an object with
+ *    `content-encoding === 'gzip'` auto-decompresses the stream and omits `Content-Length`
+ *    (the uncompressed size is not predetermined) and `Content-Encoding: gzip`, the HEAD
+ *    response must also omit both headers when `metadata.contentEncoding?.trim() === 'gzip'`.
+ *    Trimming mirrors HTTP parser whitespace stripping (RFC 9110 §5.5) before SDK evaluation.
+ *    Emitting `metadata.size` on HEAD would misrepresent the representation length as the compressed
+ *    size when GET delivers uncompressed bytes.
+ * 2. **Weak ETag Conversion (RFC 9110 §8.8.1 & §8.8.3)**: The ETag is formatted with a weak
+ *    prefix (`W/"..."`) matching the GET response validator for decompressed entities.
+ * 3. **Non-Gzip or Case-Mismatched Encodings**: For objects without exact `'gzip'` encoding
+ *    (e.g., `'GZIP'`, `'br'`, or uncompressed), `metadata.size` is set as `Content-Length`,
+ *    `Content-Encoding` is preserved, and a strong ETag is returned.
+ *
  * @packageDocumentation
  */
 
@@ -19,17 +44,18 @@ function applySizeHeader(res: ServerResponse, size?: number | string): void {
   if (size !== undefined) res.setHeader('Content-Length', String(size));
 }
 
-function applyEncodingHeader(res: ServerResponse, rawEncoding?: string, encoding?: string): void {
-  if (rawEncoding && encoding !== 'identity') res.setHeader('Content-Encoding', rawEncoding);
+function isPassthroughEncoding(encoding: string): boolean {
+  return encoding !== '' && encoding.toLowerCase() !== 'identity';
 }
 
-function applyUncompressedHeaders(
-  res: ServerResponse,
-  metadata: MetadataLike,
-  encoding?: string,
-): void {
+function applyEncodingHeader(res: ServerResponse, rawEncoding?: string): void {
+  const trimmed = rawEncoding ? rawEncoding.trim() : '';
+  if (isPassthroughEncoding(trimmed)) res.setHeader('Content-Encoding', trimmed);
+}
+
+function applyUncompressedHeaders(res: ServerResponse, metadata: MetadataLike): void {
   applySizeHeader(res, metadata.size);
-  applyEncodingHeader(res, metadata.contentEncoding, encoding);
+  applyEncodingHeader(res, metadata.contentEncoding);
 }
 
 function formatHeadEtag(metadata: MetadataLike, isGzip: boolean, opts: StorageHeadOptions): string {
@@ -57,14 +83,9 @@ function logHeadEtag(
   logStorageEtagDecision(opts.logger, etagInput(meta, formattedEtag, isGzip, opts.fullPath));
 }
 
-function gzipState(metadata: MetadataLike): { encoding?: string; isGzip: boolean } {
-  const encoding = metadata.contentEncoding?.trim().toLowerCase();
-  return { encoding, isGzip: encoding === 'gzip' };
-}
-
 function writeBody(res: ServerResponse, meta: MetadataLike, opts: StorageHeadOptions): void {
-  const { encoding, isGzip } = gzipState(meta);
-  if (!isGzip) applyUncompressedHeaders(res, meta, encoding);
+  const isGzip = meta.contentEncoding?.trim() === 'gzip';
+  if (!isGzip) applyUncompressedHeaders(res, meta);
   logHeadEtag(meta, applyHeadEtag(res, formatHeadEtag(meta, isGzip, opts)), isGzip, opts);
 }
 
@@ -74,6 +95,17 @@ function setHeadBaseHeaders(res: ServerResponse, opts: StorageHeadOptions): void
   res.setHeader('Cache-Control', opts.cacheControl);
 }
 
+/**
+ * Writes successful HTTP HEAD headers for a storage object and concludes the response.
+ *
+ * @remarks
+ * Sets base status and MIME headers, conditionally emits length/encoding headers, applies
+ * RFC 9110 compliant weak/strong ETags, logs telemetry decisions, and closes the response stream.
+ *
+ * @param res - The active Node.js server response stream.
+ * @param metadata - Object metadata retrieved from GCS (`file.getMetadata()`).
+ * @param opts - Context options including content type, cache control, logger, and formatter.
+ */
 export function writeHeadSuccess(
   res: ServerResponse,
   metadata: MetadataLike,

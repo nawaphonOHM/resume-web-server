@@ -1,6 +1,32 @@
 /**
  * GCS response header extractor and HTTP response header setter for GET streaming.
  *
+ * @remarks
+ * ## RFC 9110 & GCS Automatic Stream Decompression Semantics
+ *
+ * In the Google Cloud Storage Node.js SDK (`@google-cloud/storage`), `file.createReadStream()`
+ * automatically decompresses object payloads on the fly via an internal gunzip transform stream
+ * when `options.decompress !== false` (default `true`) and the parsed HTTP response header is
+ * exactly `content-encoding === 'gzip'` (after HTTP header whitespace stripping per RFC 9110 §5.5).
+ *
+ * Because the delivered representation body consists of decompressed plaintext/binary bytes
+ * rather than the raw compressed entity stored in the bucket, transmitting original metadata
+ * headers would violate HTTP transport semantics:
+ * 1. **Content-Length Omission (RFC 9110 §8.6)**: The stored `Content-Length` represents the
+ *    compressed byte count. Sending this value would cause downstream clients to prematurely
+ *    truncate or error on the decompressed stream. Because the uncompressed stream size is not
+ *    predetermined without fully buffering the object, `Content-Length` is omitted, allowing
+ *    chunked transfer framing.
+ * 2. **Content-Encoding Omission (RFC 9110 §8.4)**: `Content-Encoding: gzip` indicates that the
+ *    client must decode the payload using gzip. Because the SDK already decompressed the stream,
+ *    omitting `Content-Encoding` informs the client that the received payload is identity-encoded.
+ * 3. **Weak ETag Conversion (RFC 9110 §8.8.1 & §8.8.3)**: Strong validators guarantee byte-for-byte
+ *    equality of stored entities. Because the representation bytes have undergone transformation
+ *    (gzip decompression), the strong ETag is converted to a weak validator (`W/"..."`).
+ *
+ * Non-gzip or case-mismatched encodings (e.g., `'GZIP'`, `'br'`) do not trigger SDK automatic
+ * decompression, so their `Content-Length`, `Content-Encoding`, and strong ETags are preserved as-is.
+ *
  * @packageDocumentation
  */
 
@@ -17,18 +43,19 @@ function stringHeader(value: string | string[] | undefined): string | undefined 
   return undefined;
 }
 
-function applyEncoding(res: StorageHeadOptions['res'], raw?: string, encoding?: string): void {
-  if (raw && encoding !== 'identity') res.setHeader('Content-Encoding', raw);
+function isPassthroughEncoding(encoding: string): boolean {
+  return encoding !== '' && encoding.toLowerCase() !== 'identity';
 }
 
-function applyLengthAndEncoding(
-  opts: StorageHeadOptions,
-  headers: GcsHeaders,
-  encoding?: string,
-): void {
+function applyEncoding(res: StorageHeadOptions['res'], raw?: string): void {
+  const trimmed = raw ? raw.trim() : '';
+  if (isPassthroughEncoding(trimmed)) res.setHeader('Content-Encoding', trimmed);
+}
+
+function applyLengthAndEncoding(opts: StorageHeadOptions, headers: GcsHeaders): void {
   const length = stringHeader(headers['content-length']);
   if (length) opts.res.setHeader('Content-Length', length);
-  applyEncoding(opts.res, stringHeader(headers['content-encoding']), encoding);
+  applyEncoding(opts.res, stringHeader(headers['content-encoding']));
 }
 
 function extractFormattedEtag(
@@ -47,10 +74,9 @@ function applyEtag(opts: StorageHeadOptions, formatted: string): void {
 function writeConditionalHeaders(
   headers: GcsHeaders,
   opts: StorageHeadOptions,
-  encoding: string | undefined,
   isGzip: boolean,
 ): void {
-  if (!isGzip) applyLengthAndEncoding(opts, headers, encoding);
+  if (!isGzip) applyLengthAndEncoding(opts, headers);
   const rawEtag = stringHeader(headers['etag']);
   applyEtag(opts, extractFormattedEtag(rawEtag, isGzip, opts.etagFormatter));
 }
@@ -76,11 +102,21 @@ function setBaseGetHeaders(opts: StorageHeadOptions): void {
   opts.res.setHeader('Cache-Control', opts.cacheControl);
 }
 
+/**
+ * Applies HTTP headers to the response based on GCS streaming response headers.
+ *
+ * @remarks
+ * Handles base headers (status 200, Content-Type, Cache-Control), conditional headers
+ * (Content-Length and Content-Encoding for non-gzip payloads, formatted weak/strong ETags per RFC 9110),
+ * and logs telemetry decisions for the emitted headers.
+ *
+ * @param gcsHeaders - Header map received from the GCS read stream response event.
+ * @param opts - Context options including response stream, logger, formatter, and path.
+ */
 export function writeGetStreamHeaders(gcsHeaders: GcsHeaders, opts: StorageHeadOptions): void {
   setBaseGetHeaders(opts);
   const rawEncoding = stringHeader(gcsHeaders['content-encoding']);
-  const encoding = rawEncoding?.trim().toLowerCase();
-  const isGzip = encoding === 'gzip';
-  writeConditionalHeaders(gcsHeaders, opts, encoding, isGzip);
+  const isGzip = rawEncoding?.trim() === 'gzip';
+  writeConditionalHeaders(gcsHeaders, opts, isGzip);
   logGetEtag(gcsHeaders, opts, isGzip);
 }
