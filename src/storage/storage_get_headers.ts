@@ -7,25 +7,31 @@
  * In the Google Cloud Storage Node.js SDK (`@google-cloud/storage`), `file.createReadStream()`
  * automatically decompresses object payloads on the fly via an internal gunzip transform stream
  * when `options.decompress !== false` (default `true`) and the parsed HTTP response header is
- * exactly `content-encoding === 'gzip'` (after HTTP header whitespace stripping per RFC 9110 §5.5).
+ * exactly `content-encoding === 'gzip'`. The HTTP parser/transport layer strips optional whitespace
+ * (OWS) around field values per RFC 9110 §5.5 before header values reach client code, and our
+ * `.trim()` check defensively normalizes any surrounding whitespace.
  *
  * Because the delivered representation body consists of decompressed plaintext/binary bytes
- * rather than the raw compressed entity stored in the bucket, transmitting original metadata
- * headers would violate HTTP transport semantics:
- * 1. **Content-Length Omission (RFC 9110 §8.6)**: The stored `Content-Length` represents the
- *    compressed byte count. Sending this value would cause downstream clients to prematurely
- *    truncate or error on the decompressed stream. Because the uncompressed stream size is not
- *    predetermined without fully buffering the object, `Content-Length` is omitted, allowing
- *    chunked transfer framing.
- * 2. **Content-Encoding Omission (RFC 9110 §8.4)**: `Content-Encoding: gzip` indicates that the
- *    client must decode the payload using gzip. Because the SDK already decompressed the stream,
- *    omitting `Content-Encoding` informs the client that the received payload is identity-encoded.
- * 3. **Weak ETag Conversion (RFC 9110 §8.8.1 & §8.8.3)**: Strong validators guarantee byte-for-byte
- *    equality of stored entities. Because the representation bytes have undergone transformation
- *    (gzip decompression), the strong ETag is converted to a weak validator (`W/"..."`).
+ * rather than the raw compressed entity stored in the bucket:
+ * 1. **Content-Length Omission (RFC 9110 §8.6 Invariant)**: RFC 9110 §8.6 requires `Content-Length`
+ *    to represent the actual octet count of the emitted message payload. Because the payload has
+ *    been decompressed and the uncompressed byte count is unknown in a streaming pipeline without
+ *    buffering the entire object, `Content-Length` must be omitted (falling back to chunked transfer
+ *    encoding). Sending the stored compressed byte count would cause downstream clients to prematurely
+ *    truncate the stream or fail on framing.
+ * 2. **Content-Encoding Omission (RFC 9110 §8.4 Invariant)**: RFC 9110 §8.4 defines `Content-Encoding`
+ *    as a modifier indicating what coding transformations have been applied to the representation.
+ *    Because the SDK already decompressed the stream, the emitted payload is identity-encoded, so
+ *    `Content-Encoding` must be omitted.
+ * 3. **Weak ETag Conversion (Implementation Decision for RFC 9110 §8.8.1 & §8.8.3)**: RFC 9110
+ *    forbids reusing a strong validator for two representations with different byte content
+ *    (decompressed representation vs stored compressed entity). Converting the GCS strong ETag to
+ *    a weak validator (`W/"..."`) is our chosen implementation strategy to satisfy validator semantics
+ *    while preserving cache validation utility.
  *
- * Non-gzip or case-mismatched encodings (e.g., `'GZIP'`, `'br'`) do not trigger SDK automatic
- * decompression, so their `Content-Length`, `Content-Encoding`, and strong ETags are preserved as-is.
+ * Non-gzip or case-mismatched encodings (e.g., `'GZIP'`, `'br'`, `'deflate'`) do not trigger SDK automatic
+ * decompression (the SDK checks `=== 'gzip'` exactly), so their compressed bytes, `Content-Length`,
+ * `Content-Encoding`, and strong ETags are preserved as-is.
  *
  * @packageDocumentation
  */
