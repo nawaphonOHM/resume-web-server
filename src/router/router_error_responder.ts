@@ -5,6 +5,7 @@
  */
 
 import type { ServerResponse } from 'node:http';
+import { isResponseWritable } from '../http/http_response_state.ts';
 import {
   HTTP_STATUS_BAD_REQUEST,
   HTTP_STATUS_INTERNAL_SERVER_ERROR,
@@ -15,10 +16,6 @@ export function write400BadRequest(res: ServerResponse): void {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache');
   res.end('Bad Request');
-}
-
-function isResponseWritable(res: ServerResponse): boolean {
-  return !res.headersSent && !res.destroyed && !res.writableEnded;
 }
 
 export function write500InternalServerError(res: ServerResponse): void {

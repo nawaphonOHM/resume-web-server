@@ -6,7 +6,10 @@
 
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 import type { Socket } from 'node:net';
-import { HTTP_STATUS_INTERNAL_SERVER_ERROR } from '../http/http_status_codes.ts';
+import { defaultLogger } from '../default_logger.ts';
+import type { AppLogger } from '../logger/logger_types.ts';
+import { write500InternalServerError } from '../router/router_error_responder.ts';
+import { logUnhandledRouterError } from '../router/router_telemetry.ts';
 import type { IShutdownManager } from './server_types.ts';
 
 function handleShutdownHeaders(res: ServerResponse, isShuttingDown: boolean): void {
@@ -44,50 +47,76 @@ function attachShutdownGuards(
   attachCloseGuard(res, socket, isStopping);
 }
 
-function isResponseWritable(res: ServerResponse): boolean {
-  return !res.headersSent && !res.destroyed && !res.writableEnded;
+function tryLogRouterError(
+  logger: AppLogger,
+  req: IncomingMessage,
+  err: unknown,
+): void {
+  try {
+    logUnhandledRouterError(logger, req, err);
+  } catch {
+    // Best-effort logging; ignore logger failures
+  }
 }
 
-function handleRouterError(res: ServerResponse): void {
-  if (isResponseWritable(res)) {
-    res.statusCode = HTTP_STATUS_INTERNAL_SERVER_ERROR;
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.end('Internal Server Error');
-  }
+function handleRouterError(
+  logger: AppLogger,
+  req: IncomingMessage,
+  res: ServerResponse,
+  err: unknown,
+): void {
+  tryLogRouterError(logger, req, err);
+  write500InternalServerError(res);
 }
 
 function dispatchRequest(
   req: IncomingMessage,
   res: ServerResponse,
   router: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
+  logger: AppLogger,
 ): void {
-  router(req, res).catch(() => {
-    handleRouterError(res);
+  router(req, res).catch((err: unknown) => {
+    handleRouterError(logger, req, res, err);
   });
 }
 
-function handleIncomingRequest(
-  req: IncomingMessage,
+type HttpRouter = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+type HttpHandler = (req: IncomingMessage, res: ServerResponse) => void;
+
+function handleIncoming(
   res: ServerResponse,
+  socket: Socket,
   isStopping: () => boolean,
-  router: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
 ): void {
   handleShutdownHeaders(res, isStopping());
-  attachShutdownGuards(res, req.socket, isStopping);
-  dispatchRequest(req, res, router);
+  attachShutdownGuards(res, socket, isStopping);
+}
+
+function makeDispatcher(
+  router: HttpRouter,
+  isStopping: () => boolean,
+  logger: AppLogger,
+): HttpHandler {
+  return (req, res): void => {
+    handleIncoming(res, req.socket, isStopping);
+    dispatchRequest(req, res, router, logger);
+  };
 }
 
 /**
  * Creates an HTTP request listener that delegates to the router and handles shutdown headers.
+ *
+ * @param router - Async routing function handling incoming requests.
+ * @param shutdownManager - Manager tracking server shutdown state.
+ * @param server - HTTP server instance.
+ * @param logger - Optional application logger for error recording (defaults to {@link defaultLogger}).
  */
 export function createHttpRequestHandler(
-  router: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
+  router: HttpRouter,
   shutdownManager: IShutdownManager,
   server: Server,
-): (req: IncomingMessage, res: ServerResponse) => void {
+  logger: AppLogger = defaultLogger,
+): HttpHandler {
   const isStopping = () => shutdownManager.isShuttingDown(server);
-  return (req: IncomingMessage, res: ServerResponse): void => {
-    handleIncomingRequest(req, res, isStopping, router);
-  };
+  return makeDispatcher(router, isStopping, logger);
 }

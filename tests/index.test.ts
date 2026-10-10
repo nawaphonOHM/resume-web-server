@@ -28,6 +28,12 @@ import {
   attachResponseSocketDrainer,
   createShutdownRequestInterceptor,
 } from '../src/shutdown/shutdown_interceptor.ts';
+import { isResponseWritable } from '../src/http/http_response_state.ts';
+import { createHttpRequestHandler } from '../src/server/server_request_handler.ts';
+import {
+  write500InternalServerError,
+  write400BadRequest,
+} from '../src/router/router_error_responder.ts';
 
 // Ensure process.env has baseline mock values for server startup in tests
 process.env['GCS_BUCKET_NAME'] = 'test-bucket';
@@ -1381,6 +1387,408 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
       const indexPath = fileURLToPath(new URL('../src/index.ts', import.meta.url));
       assert.equal(isMainModule(undefined, indexPath), true);
       assert.equal(isMainModule(), false);
+    });
+  });
+
+  /**
+   * Tests for HTTP response writability checks, router error responders, and request dispatcher error handling.
+   */
+  void describe('HTTP Request Handler & Response Writability State', () => {
+    void describe('isResponseWritable', () => {
+      void it('should return true when response is writable and not sent/ended/destroyed', () => {
+        const fakeRes = {
+          headersSent: false,
+          destroyed: false,
+          writableEnded: false,
+        } as unknown as http.ServerResponse;
+        assert.equal(isResponseWritable(fakeRes), true);
+      });
+
+      void it('should return false when headers have already been sent', () => {
+        const fakeRes = {
+          headersSent: true,
+          destroyed: false,
+          writableEnded: false,
+        } as unknown as http.ServerResponse;
+        assert.equal(isResponseWritable(fakeRes), false);
+      });
+
+      void it('should return false when response is destroyed', () => {
+        const fakeRes = {
+          headersSent: false,
+          destroyed: true,
+          writableEnded: false,
+        } as unknown as http.ServerResponse;
+        assert.equal(isResponseWritable(fakeRes), false);
+      });
+
+      void it('should return false when writable has ended', () => {
+        const fakeRes = {
+          headersSent: false,
+          destroyed: false,
+          writableEnded: true,
+        } as unknown as http.ServerResponse;
+        assert.equal(isResponseWritable(fakeRes), false);
+      });
+
+      void it('should accurately reflect state transitions during HTTP request lifecycle', async () => {
+        let capturedRes!: http.ServerResponse;
+        const server = http.createServer((_req, res) => {
+          capturedRes = res;
+          assert.equal(isResponseWritable(res), true);
+          res.end('ok');
+          assert.equal(isResponseWritable(res), false);
+        });
+
+        await new Promise<void>((resolve) => {
+          server.listen(0, '127.0.0.1', () => {
+            const addr = server.address() as { port: number };
+            http.get(`http://127.0.0.1:${String(addr.port)}/`, (clientRes) => {
+              clientRes.resume();
+              clientRes.on('end', () => {
+                server.close(() => resolve());
+              });
+            });
+          });
+        });
+        assert.equal(isResponseWritable(capturedRes), false);
+      });
+
+      void it('should return false when response socket is destroyed mid-stream', async () => {
+        let capturedRes!: http.ServerResponse;
+        const server = http.createServer((_req, res) => {
+          capturedRes = res;
+          assert.equal(isResponseWritable(res), true);
+          res.destroy();
+          assert.equal(isResponseWritable(res), false);
+        });
+
+        await new Promise<void>((resolve) => {
+          server.listen(0, '127.0.0.1', () => {
+            const addr = server.address() as { port: number };
+            const req = http.get(`http://127.0.0.1:${String(addr.port)}/`);
+            req.on('error', () => {
+              server.close(() => resolve());
+            });
+          });
+        });
+        assert.equal(isResponseWritable(capturedRes), false);
+      });
+    });
+
+    void describe('write500InternalServerError & write400BadRequest', () => {
+      void it('should write 500 Internal Server Error when response is writable', () => {
+        let statusCode = 0;
+        let ended = false;
+        const headers: Record<string, string> = {};
+        const fakeRes = {
+          headersSent: false,
+          destroyed: false,
+          writableEnded: false,
+          set statusCode(code: number) {
+            statusCode = code;
+          },
+          setHeader(k: string, v: string) {
+            headers[k] = v;
+          },
+          end(body?: string) {
+            ended = true;
+            assert.equal(body, 'Internal Server Error');
+          },
+        } as unknown as http.ServerResponse;
+
+        write500InternalServerError(fakeRes);
+        assert.equal(statusCode, 500);
+        assert.equal(headers['Content-Type'], 'text/plain; charset=utf-8');
+        assert.equal(headers['Cache-Control'], 'no-cache');
+        assert.equal(ended, true);
+      });
+
+      void it('should skip writing 500 when response is not writable', () => {
+        let writeAttempted = false;
+        const fakeRes = {
+          headersSent: true,
+          destroyed: false,
+          writableEnded: false,
+          set statusCode(_code: number) {
+            writeAttempted = true;
+          },
+          setHeader(_k: string, _v: string) {
+            writeAttempted = true;
+          },
+          end(_body?: string) {
+            writeAttempted = true;
+          },
+        } as unknown as http.ServerResponse;
+
+        write500InternalServerError(fakeRes);
+        assert.equal(writeAttempted, false);
+      });
+
+      void it('should write 400 Bad Request directly to response', () => {
+        let statusCode = 0;
+        let ended = false;
+        const headers: Record<string, string> = {};
+        const fakeRes = {
+          set statusCode(code: number) {
+            statusCode = code;
+          },
+          setHeader(k: string, v: string) {
+            headers[k] = v;
+          },
+          end(body?: string) {
+            ended = true;
+            assert.equal(body, 'Bad Request');
+          },
+        } as unknown as http.ServerResponse;
+
+        write400BadRequest(fakeRes);
+        assert.equal(statusCode, 400);
+        assert.equal(headers['Content-Type'], 'text/plain; charset=utf-8');
+        assert.equal(headers['Cache-Control'], 'no-cache');
+        assert.equal(ended, true);
+      });
+    });
+
+    void describe('createHttpRequestHandler', () => {
+      void it('should catch unhandled router promise rejection, log error with stack, and send 500', async () => {
+        const logs: Array<{ message: string; meta: unknown[] }> = [];
+        const spyLogger: AppLogger = {
+          info: () => {},
+          warn: () => {},
+          http: () => {},
+          debug: () => {},
+          decision: () => {},
+          error: (msg: string | Error, ...meta: unknown[]) => {
+            logs.push({ message: typeof msg === 'string' ? msg : msg.message, meta });
+          },
+        };
+
+        const routerError = new Error('Unexpected database failure');
+        const router = () => Promise.reject(routerError);
+        const shutdownManager = { isShuttingDown: () => false };
+        const server = http.createServer();
+        const handler = createHttpRequestHandler(
+          router,
+          shutdownManager as unknown as GracefulShutdownManager,
+          server,
+          spyLogger,
+        );
+
+        let statusCode = 0;
+        let ended = false;
+        const headers: Record<string, string> = {};
+        const fakeRes = {
+          headersSent: false,
+          destroyed: false,
+          writableEnded: false,
+          set statusCode(code: number) {
+            statusCode = code;
+          },
+          setHeader(k: string, v: string) {
+            headers[k] = v;
+          },
+          end(body?: string) {
+            ended = true;
+            assert.equal(body, 'Internal Server Error');
+          },
+          on: () => fakeRes,
+        } as unknown as http.ServerResponse;
+
+        const fakeReq = {
+          url: '/api/v1/resource?token=secret123',
+          method: 'GET',
+          socket: new Socket(),
+        } as unknown as http.IncomingMessage;
+
+        handler(fakeReq, fakeRes);
+
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(statusCode, 500);
+        assert.equal(ended, true);
+        assert.equal(headers['Content-Type'], 'text/plain; charset=utf-8');
+        assert.equal(headers['Cache-Control'], 'no-cache');
+
+        assert.equal(logs.length, 1);
+        assert.equal(logs[0].message, 'Unhandled router error while processing request');
+        assert.equal(logs[0].meta[0], routerError);
+        assert.deepEqual(logs[0].meta[1], {
+          path: '/api/v1/resource',
+          method: 'GET',
+          statusCode: 500,
+        });
+      });
+
+      void it('should write 500 and not produce unhandled rejection when logger.error throws', async () => {
+        const throwingLogger: AppLogger = {
+          info: () => {},
+          warn: () => {},
+          http: () => {},
+          debug: () => {},
+          decision: () => {},
+          error: () => {
+            throw new Error('Logger sink crashed');
+          },
+        };
+
+        const rejections: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          rejections.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+
+        try {
+          const routerError = new Error('Database disconnected');
+          const router = () => Promise.reject(routerError);
+          const shutdownManager = { isShuttingDown: () => false };
+          const server = http.createServer();
+          const handler = createHttpRequestHandler(
+            router,
+            shutdownManager as unknown as GracefulShutdownManager,
+            server,
+            throwingLogger,
+          );
+
+          let statusCode = 0;
+          let ended = false;
+          const headers: Record<string, string> = {};
+          const fakeRes = {
+            headersSent: false,
+            destroyed: false,
+            writableEnded: false,
+            set statusCode(code: number) {
+              statusCode = code;
+            },
+            setHeader(k: string, v: string) {
+              headers[k] = v;
+            },
+            end(body?: string) {
+              ended = true;
+              assert.equal(body, 'Internal Server Error');
+            },
+            on: () => fakeRes,
+          } as unknown as http.ServerResponse;
+
+          const fakeReq = {
+            url: '/failing/endpoint',
+            method: 'GET',
+            socket: new Socket(),
+          } as unknown as http.IncomingMessage;
+
+          handler(fakeReq, fakeRes);
+
+          await new Promise((resolve) => setImmediate(resolve));
+
+          assert.equal(statusCode, 500);
+          assert.equal(ended, true);
+          assert.equal(headers['Content-Type'], 'text/plain; charset=utf-8');
+          assert.equal(headers['Cache-Control'], 'no-cache');
+          assert.equal(rejections.length, 0);
+        } finally {
+          process.removeListener('unhandledRejection', onUnhandled);
+        }
+      });
+
+      void it('should still log unhandled router error when response is unwritable without throwing', async () => {
+        const logs: Array<{ message: string; meta: unknown[] }> = [];
+        const spyLogger: AppLogger = {
+          info: () => {},
+          warn: () => {},
+          http: () => {},
+          debug: () => {},
+          decision: () => {},
+          error: (msg: string | Error, ...meta: unknown[]) => {
+            logs.push({ message: typeof msg === 'string' ? msg : msg.message, meta });
+          },
+        };
+
+        const routerError = new Error('Stream pipe broke');
+        const router = () => Promise.reject(routerError);
+        const shutdownManager = { isShuttingDown: () => false };
+        const server = http.createServer();
+        const handler = createHttpRequestHandler(
+          router,
+          shutdownManager as unknown as GracefulShutdownManager,
+          server,
+          spyLogger,
+        );
+
+        let writeAttempted = false;
+        const fakeRes = {
+          headersSent: true,
+          destroyed: false,
+          writableEnded: true,
+          set statusCode(_code: number) {
+            writeAttempted = true;
+          },
+          setHeader(_k: string, _v: string) {
+            writeAttempted = true;
+          },
+          end(_body?: string) {
+            writeAttempted = true;
+          },
+          on: () => fakeRes,
+        } as unknown as http.ServerResponse;
+
+        const fakeReq = {
+          url: '/download/file.tar.gz',
+          method: 'GET',
+          socket: new Socket(),
+        } as unknown as http.IncomingMessage;
+
+        handler(fakeReq, fakeRes);
+
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(writeAttempted, false);
+        assert.equal(logs.length, 1);
+        assert.equal(logs[0].message, 'Unhandled router error while processing request');
+        assert.equal(logs[0].meta[0], routerError);
+      });
+
+      void it('should format Winston error output with Error Detail and Call Stack on router rejection', async () => {
+        const { appLogger, stream } = createMemoryLogger();
+        const innerError = new Error('GCS connection reset');
+        const routerError = new Error('Unhandled router crash', { cause: innerError });
+        const router = () => Promise.reject(routerError);
+        const shutdownManager = { isShuttingDown: () => false };
+        const server = http.createServer();
+        const handler = createHttpRequestHandler(
+          router,
+          shutdownManager as unknown as GracefulShutdownManager,
+          server,
+          appLogger,
+        );
+
+        const fakeRes = {
+          headersSent: false,
+          destroyed: false,
+          writableEnded: false,
+          statusCode: 200,
+          setHeader: () => {},
+          end: () => {},
+          on: () => fakeRes,
+        } as unknown as http.ServerResponse;
+
+        const fakeReq = {
+          url: '/test-error-path?key=private',
+          method: 'POST',
+          socket: new Socket(),
+        } as unknown as http.IncomingMessage;
+
+        handler(fakeReq, fakeRes);
+
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const output = stream.output;
+        assert.ok(output.includes('[error]: Unhandled router error while processing request'));
+        assert.ok(output.includes('Path: /test-error-path'));
+        assert.ok(!output.includes('private'), 'Should not leak query parameters');
+        assert.ok(output.includes('Error Detail: Error: Unhandled router crash'));
+        assert.ok(output.includes('Call Stack:'));
+        assert.ok(output.includes('Caused by: Error: GCS connection reset'));
+      });
     });
   });
 });
