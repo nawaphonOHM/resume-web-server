@@ -5,6 +5,7 @@
  */
 
 import type { ServerResponse } from 'node:http';
+import { isResponseWritable } from '../http/http_response_state.ts';
 import { HTTP_STATUS_NOT_FOUND } from '../http/http_status_codes.ts';
 import type { AppLogger } from '../logger/logger_types.ts';
 import {
@@ -88,13 +89,9 @@ function classify(ctx: StorageErrorContext): boolean {
   return ctx.errorClassifier.isNotFoundError(ctx.err);
 }
 
-function isFullyWritable(res: ServerResponse): boolean {
-  return !res.headersSent && !res.destroyed && !res.writableEnded;
-}
-
 export function handleHeadStorageError(ctx: StorageErrorContext): void {
   const is404 = classify(ctx);
-  if (isFullyWritable(ctx.res)) {
+  if (isResponseWritable(ctx.res)) {
     respondPreStream(ctx, is404);
     return;
   }

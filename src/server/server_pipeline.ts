@@ -9,6 +9,7 @@ import type { Socket } from 'node:net';
 import type { ServerConfig } from '../config/config.ts';
 import { createRouter } from '../router/router.ts';
 import { logger as defaultLogger, toAppLogger } from '../logger/logger.ts';
+import type { AppLogger } from '../logger/logger_types.ts';
 import { SocketConnectionTracker } from '../socket_tracker.ts';
 import { createHttpRequestHandler } from './server_request_handler.ts';
 import { buildServerInstance, type ServerInstanceBuildContext } from './server_instance_builder.ts';
@@ -28,9 +29,10 @@ import type {
 function createHttpServer(
   router: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
   shutdownManager: IShutdownManager,
+  logger: AppLogger,
 ): Server {
   const server = createServer();
-  const handler = createHttpRequestHandler(router, shutdownManager, server);
+  const handler = createHttpRequestHandler(router, shutdownManager, server, logger);
   server.on('request', handler);
   return server;
 }
@@ -58,7 +60,7 @@ function createPipelineServer(
   const appLogger = toAppLogger(options.logger);
   const storage = resolveStorage(options, config, appLogger);
   const router = createRouter({ storageService: storage, logger: appLogger });
-  return createHttpServer(router, shutdownManager);
+  return createHttpServer(router, shutdownManager, appLogger);
 }
 
 /**
