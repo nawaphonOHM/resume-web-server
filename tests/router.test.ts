@@ -1744,11 +1744,7 @@ void describe('HTTP Router & Request Handler', () => {
         }
 
         // 4. SPA navigation routes with dotted intermediate directory segments
-        const dottedPaths = [
-          '/v1.2/overview',
-          '/dashboard/v2.0/settings',
-          '/release-1.0/overview',
-        ];
+        const dottedPaths = ['/v1.2/overview', '/dashboard/v2.0/settings', '/release-1.0/overview'];
         for (const dottedPath of dottedPaths) {
           const res = await performHttpRequest(serverPort, { path: dottedPath });
           assert.equal(res.statusCode, 200, `Expected 200 for dotted SPA route ${dottedPath}`);
