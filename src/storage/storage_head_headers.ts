@@ -10,21 +10,26 @@
  * When querying metadata from Google Cloud Storage via `file.getMetadata()`, GCS returns the
  * stored object metadata (e.g., `metadata.size` indicating the stored compressed byte count,
  * `metadata.contentEncoding`). Unlike `file.createReadStream()` with default `decompress: true`,
- * `file.getMetadata()` does not download or stream payload bytes.
+ * `file.getMetadata()` does not download or stream payload bytes. Because the GCS SDK always
+ * requests `Accept-Encoding: gzip` when fetching object media, an object with stored metadata
+ * `contentEncoding: 'gzip'` will be served with `Content-Encoding: gzip` and automatically
+ * decompressed by the SDK during GET requests.
  *
- * However, to maintain strict header parity with GET responses under RFC 9110 §9.3.2:
- * 1. **Content-Length & Content-Encoding Omission**: Because a GET request for an object with
- *    `content-encoding === 'gzip'` auto-decompresses the stream and omits `Content-Length`
- *    (the uncompressed size is not predetermined) and `Content-Encoding: gzip`, the HEAD
- *    response must also omit both headers when `metadata.contentEncoding?.trim() === 'gzip'`.
- *    Trimming mirrors HTTP parser whitespace stripping (RFC 9110 §5.5) before SDK evaluation.
- *    Emitting `metadata.size` on HEAD would misrepresent the representation length as the compressed
- *    size when GET delivers uncompressed bytes.
- * 2. **Weak ETag Conversion (RFC 9110 §8.8.1 & §8.8.3)**: The ETag is formatted with a weak
- *    prefix (`W/"..."`) matching the GET response validator for decompressed entities.
+ * To maintain header parity with GET responses under RFC 9110 §9.3.2:
+ * 1. **Content-Length & Content-Encoding Omission (Implementation Decision for GET Parity)**:
+ *    Because an equivalent GET request auto-decompresses the stream and omits `Content-Length`
+ *    (the decompressed length is unknown in stream mode) and `Content-Encoding`, the HEAD response
+ *    also omits both headers when `metadata.contentEncoding?.trim() === 'gzip'`. RFC 9110 §9.3.2
+ *    permits omitting header fields that are only known while generating content. Emitting
+ *    `metadata.size` on HEAD would misrepresent the representation length as the compressed size
+ *    when GET delivers uncompressed bytes.
+ * 2. **Weak ETag Conversion (Implementation Decision for GET Parity)**: The ETag is formatted with
+ *    a weak prefix (`W/"..."`) to match the weak validator emitted in GET responses for
+ *    decompressed entities under RFC 9110 §8.8.1/§8.8.3.
  * 3. **Non-Gzip or Case-Mismatched Encodings**: For objects without exact `'gzip'` encoding
- *    (e.g., `'GZIP'`, `'br'`, or uncompressed), `metadata.size` is set as `Content-Length`,
- *    `Content-Encoding` is preserved, and a strong ETag is returned.
+ *    (e.g., `'GZIP'`, `'deflate'`, `'br'`, or uncompressed), GET streams the raw compressed bytes
+ *    with `Content-Length`, `Content-Encoding`, and strong ETag preserved; HEAD maintains exact
+ *    parity by returning `metadata.size` as `Content-Length`, `metadata.contentEncoding`, and a strong ETag.
  *
  * @packageDocumentation
  */

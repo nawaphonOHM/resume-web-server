@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Readable, Writable } from 'node:stream';
+import zlib from 'node:zlib';
 import type { Storage, Bucket, File } from '@google-cloud/storage';
 import {
   GcsStorageService,
@@ -95,6 +96,13 @@ interface MockFileOptions {
   content?: string;
 
   /**
+   * Raw gzip-compressed byte payload to simulate stored compressed object data.
+   * When set and response `content-encoding === 'gzip'`, `createReadStream` simulates
+   * SDK stream auto-decompression via `zlib.createGunzip()`.
+   */
+  rawGzipContent?: Buffer;
+
+  /**
    * Whether the file is reported as existing when {@link File.exists} is invoked.
    *
    * @defaultValue `true`
@@ -162,7 +170,7 @@ function createMockFile(options: MockFileOptions, name = 'test-file'): File {
         options.metadata ?? { size: 100, etag: '"etag-123"', contentEncoding: undefined },
       ]);
     },
-    createReadStream: () => {
+    createReadStream: (streamOptions?: { decompress?: boolean }) => {
       if (options.errorOnStream) {
         const stream = new Readable({
           read() {
@@ -178,27 +186,54 @@ function createMockFile(options: MockFileOptions, name = 'test-file'): File {
         return stream;
       }
 
-      const stream = new Readable({
-        read() {
-          if (options.errorAfterResponse) {
-            return;
-          }
-          if (options.errorAfterData) {
-            this.push(Buffer.from('partial-data'));
-            process.nextTick(() => {
-              this.emit('error', options.errorAfterData);
-            });
-            return;
-          }
-          const content = options.content ?? 'sample file content';
-          this.push(Buffer.from(content));
-          this.push(null);
-        },
-        destroy(err, cb) {
+      const rawHeaders = options.emitResponseEvent?.headers;
+      const isCompressed = rawHeaders?.['content-encoding'] === 'gzip';
+      const shouldDecompress = isCompressed && (streamOptions?.decompress !== false);
+
+      let stream: Readable;
+
+      if (shouldDecompress && options.rawGzipContent) {
+        const rawStream = new Readable({
+          read() {
+            if (options.errorAfterResponse) return;
+            this.push(options.rawGzipContent);
+            this.push(null);
+          },
+        });
+        const gunzipStream = zlib.createGunzip();
+        gunzipStream.on('close', () => {
           options.onStreamDestroyed?.();
-          cb(err);
-        },
-      });
+        });
+        rawStream.pipe(gunzipStream);
+        stream = gunzipStream as unknown as Readable;
+      } else {
+        const payload =
+          options.rawGzipContent ??
+          (options.content !== undefined
+            ? Buffer.from(options.content)
+            : Buffer.from('sample file content'));
+
+        stream = new Readable({
+          read() {
+            if (options.errorAfterResponse) {
+              return;
+            }
+            if (options.errorAfterData) {
+              this.push(Buffer.from('partial-data'));
+              process.nextTick(() => {
+                this.emit('error', options.errorAfterData);
+              });
+              return;
+            }
+            this.push(payload);
+            this.push(null);
+          },
+          destroy(err, cb) {
+            options.onStreamDestroyed?.();
+            cb(err);
+          },
+        });
+      }
 
       if (options.emitResponseEvent) {
         process.nextTick(() => {
@@ -278,6 +313,11 @@ interface ResponseResult {
    * UTF-8 decoded HTTP response body string.
    */
   body: string;
+
+  /**
+   * Raw HTTP response body bytes.
+   */
+  rawBody: Buffer;
 }
 
 /**
@@ -303,16 +343,17 @@ function executeRequest(
         method,
       },
       (res) => {
-        let body = '';
-        res.setEncoding('utf8');
+        const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer | string) => {
-          body += String(chunk);
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         });
         res.on('end', () => {
+          const rawBody = Buffer.concat(chunks);
           resolve({
             statusCode: res.statusCode ?? 0,
             headers: res.headers,
-            body,
+            body: rawBody.toString('utf8'),
+            rawBody,
           });
         });
         res.on('error', reject);
@@ -682,6 +723,114 @@ void describe('GCS Storage Service', () => {
         assert.equal(identityRes.headers['content-length'], '14');
         assert.equal(identityRes.headers.etag, '"CKih16GjycICEAE="');
         assert.equal(identityRes.body, 'identity-bytes');
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should model SDK auto-decompression and exact-match semantics for gzip streams', async () => {
+      const decompressedBody = 'function main() { console.log("real-gcs-decompressed-stream-body"); }';
+      const gzippedBytes = zlib.gzipSync(Buffer.from(decompressedBody, 'utf-8'));
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/real-gzip-decompressed.js',
+          {
+            rawGzipContent: gzippedBytes,
+            emitResponseEvent: {
+              statusCode: 200,
+              headers: {
+                'content-encoding': 'gzip',
+                'content-length': String(gzippedBytes.length),
+                etag: '"tag-real-gzip"',
+              },
+            },
+          },
+        ],
+        [
+          'resume_cloudbuild/angular/exact-match-upper.js',
+          {
+            rawGzipContent: gzippedBytes,
+            emitResponseEvent: {
+              statusCode: 200,
+              headers: {
+                'content-encoding': 'GZIP',
+                'content-length': String(gzippedBytes.length),
+                etag: '"tag-upper-gzip"',
+              },
+            },
+          },
+        ],
+      ]);
+      const service = new GcsStorageService(testConfig, createMockStorage(files));
+      const testEnv = await startTestServer(service, (req, res, s) => {
+        const file = (req.url ?? '/').slice(1);
+        void s.streamFile(file, res, 'application/javascript; charset=utf-8', true, false);
+      });
+
+      try {
+        // Exact 'gzip': SDK decompresses via gunzip, server strips Content-Length and Content-Encoding, weakens ETag
+        const gzipRes = await executeRequest(testEnv.server, '/real-gzip-decompressed.js');
+        assert.equal(gzipRes.statusCode, 200);
+        assert.equal(gzipRes.headers['content-encoding'], undefined);
+        assert.equal(gzipRes.headers['content-length'], undefined);
+        assert.equal(gzipRes.headers.etag, 'W/"tag-real-gzip"');
+        assert.equal(gzipRes.body, decompressedBody);
+
+        // Non-exact 'GZIP': SDK does not decompress, server forwards raw compressed bytes, headers, and strong ETag
+        const upperRes = await executeRequest(testEnv.server, '/exact-match-upper.js');
+        assert.equal(upperRes.statusCode, 200);
+        assert.equal(upperRes.headers['content-encoding'], 'GZIP');
+        assert.equal(upperRes.headers['content-length'], String(gzippedBytes.length));
+        assert.equal(upperRes.headers.etag, '"tag-upper-gzip"');
+        assert.deepEqual(upperRes.rawBody, gzippedBytes);
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should forward deflate Content-Encoding and Content-Length on both GET and HEAD with parity', async () => {
+      const deflatePayload = 'deflate-raw-compressed-payload';
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/payload.deflate',
+          {
+            content: deflatePayload,
+            emitResponseEvent: {
+              statusCode: 200,
+              headers: {
+                'content-encoding': 'deflate',
+                'content-length': String(Buffer.byteLength(deflatePayload)),
+                etag: '"deflate-strong-etag"',
+              },
+            },
+            metadata: {
+              contentEncoding: 'deflate',
+              size: Buffer.byteLength(deflatePayload),
+              etag: '"deflate-strong-etag"',
+            },
+          },
+        ],
+      ]);
+      const service = new GcsStorageService(testConfig, createMockStorage(files));
+      const testEnv = await startTestServer(service, (req, res, s) => {
+        const isHead = req.method === 'HEAD';
+        void s.streamFile('payload.deflate', res, 'application/octet-stream', true, isHead);
+      });
+
+      try {
+        const getRes = await executeRequest(testEnv.server, '/payload.deflate', 'GET');
+        assert.equal(getRes.statusCode, 200);
+        assert.equal(getRes.headers['content-encoding'], 'deflate');
+        assert.equal(getRes.headers['content-length'], String(Buffer.byteLength(deflatePayload)));
+        assert.equal(getRes.headers.etag, '"deflate-strong-etag"');
+        assert.equal(getRes.body, deflatePayload);
+
+        const headRes = await executeRequest(testEnv.server, '/payload.deflate', 'HEAD');
+        assert.equal(headRes.statusCode, 200);
+        assert.equal(headRes.headers['content-encoding'], 'deflate');
+        assert.equal(headRes.headers['content-length'], String(Buffer.byteLength(deflatePayload)));
+        assert.equal(headRes.headers.etag, '"deflate-strong-etag"');
+        assert.equal(headRes.body, '');
       } finally {
         await testEnv.close();
       }
@@ -1345,6 +1494,8 @@ void describe('GCS Storage Service', () => {
       assert.equal(formatEtag('W/"CKih16GjycICEAE="', true), 'W/"CKih16GjycICEAE="');
       assert.equal(formatEtag('W/CKih16GjycICEAE=', false), 'W/"CKih16GjycICEAE="');
       assert.equal(formatEtag('W/CKih16GjycICEAE=', true), 'W/"CKih16GjycICEAE="');
+      assert.equal(formatEtag('  W/"CKih16GjycICEAE="  ', false), 'W/"CKih16GjycICEAE="');
+      assert.equal(formatEtag('  W/"CKih16GjycICEAE="  ', true), 'W/"CKih16GjycICEAE="');
     });
 
     void it('should return empty string for empty input', () => {
