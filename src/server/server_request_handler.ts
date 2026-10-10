@@ -47,11 +47,7 @@ function attachShutdownGuards(
   attachCloseGuard(res, socket, isStopping);
 }
 
-function tryLogRouterError(
-  logger: AppLogger,
-  req: IncomingMessage,
-  err: unknown,
-): void {
+function tryLogRouterError(logger: AppLogger, req: IncomingMessage, err: unknown): void {
   try {
     logUnhandledRouterError(logger, req, err);
   } catch {
@@ -83,11 +79,7 @@ function dispatchRequest(
 type HttpRouter = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 type HttpHandler = (req: IncomingMessage, res: ServerResponse) => void;
 
-function handleIncoming(
-  res: ServerResponse,
-  socket: Socket,
-  isStopping: () => boolean,
-): void {
+function handleIncoming(res: ServerResponse, socket: Socket, isStopping: () => boolean): void {
   handleShutdownHeaders(res, isStopping());
   attachShutdownGuards(res, socket, isStopping);
 }

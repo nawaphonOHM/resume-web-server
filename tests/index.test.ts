@@ -1548,6 +1548,27 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
         assert.equal(headers['Cache-Control'], 'no-cache');
         assert.equal(ended, true);
       });
+
+      void it('should skip writing 400 when response is not writable', () => {
+        let writeAttempted = false;
+        const fakeRes = {
+          headersSent: true,
+          destroyed: false,
+          writableEnded: false,
+          set statusCode(_code: number) {
+            writeAttempted = true;
+          },
+          setHeader(_k: string, _v: string) {
+            writeAttempted = true;
+          },
+          end(_body?: string) {
+            writeAttempted = true;
+          },
+        } as unknown as http.ServerResponse;
+
+        write400BadRequest(fakeRes);
+        assert.equal(writeAttempted, false);
+      });
     });
 
     void describe('createHttpRequestHandler', () => {
@@ -1788,6 +1809,47 @@ void describe('Server Bootstrap & Lifecycle (server/index.ts)', () => {
         assert.ok(output.includes('Error Detail: Error: Unhandled router crash'));
         assert.ok(output.includes('Call Stack:'));
         assert.ok(output.includes('Caused by: Error: GCS connection reset'));
+      });
+
+      void it('should use defaultLogger when logger argument is omitted', async () => {
+        const routerError = new Error('Default logger fallback test');
+        const router = () => Promise.reject(routerError);
+        const shutdownManager = { isShuttingDown: () => false };
+        const server = http.createServer();
+        const handler = createHttpRequestHandler(
+          router,
+          shutdownManager as unknown as GracefulShutdownManager,
+          server,
+        );
+
+        let statusCode = 0;
+        let ended = false;
+        const fakeRes = {
+          headersSent: false,
+          destroyed: false,
+          writableEnded: false,
+          set statusCode(code: number) {
+            statusCode = code;
+          },
+          setHeader: () => {},
+          end: (body?: string) => {
+            ended = true;
+            assert.equal(body, 'Internal Server Error');
+          },
+          on: () => fakeRes,
+        } as unknown as http.ServerResponse;
+
+        const fakeReq = {
+          url: '/test-default-logger',
+          method: 'GET',
+          socket: new Socket(),
+        } as unknown as http.IncomingMessage;
+
+        handler(fakeReq, fakeRes);
+
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(statusCode, 500);
+        assert.equal(ended, true);
       });
     });
   });
