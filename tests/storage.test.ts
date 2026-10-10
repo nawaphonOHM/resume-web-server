@@ -575,7 +575,8 @@ void describe('GCS Storage Service', () => {
         assert.equal(response.statusCode, 200);
         assert.equal(response.headers['content-type'], 'application/javascript; charset=utf-8');
         // Must NOT forward raw compressed content-length (60) because decompressed bytes are 1350
-        assert.notEqual(response.headers['content-length'], '60');
+        assert.equal(response.headers['content-length'], undefined);
+        assert.equal(response.headers['content-encoding'], undefined);
         // ETag should be converted to weak validator when auto-decompressed and quoted per RFC 9110
         assert.equal(response.headers.etag, 'W/"CKih16GjycICEAE="');
         // Full decompressed body must be received completely without truncation
@@ -623,6 +624,64 @@ void describe('GCS Storage Service', () => {
         assert.equal(response.headers['content-length'], String(Buffer.byteLength(rawBrContent)));
         assert.equal(response.headers.etag, '"CKih16GjycICEAE="');
         assert.equal(response.body, rawBrContent);
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should preserve Content-Encoding, Content-Length, and strong ETag for noncanonical gzip encodings (e.g. GZIP, identity)', async () => {
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/uppercase-gzip.js',
+          {
+            content: 'raw-gzip-bytes',
+            emitResponseEvent: {
+              statusCode: 200,
+              headers: {
+                'content-encoding': 'GZIP',
+                'content-length': '14',
+                etag: 'CKih16GjycICEAE=',
+              },
+            },
+          },
+        ],
+        [
+          'resume_cloudbuild/angular/identity.js',
+          {
+            content: 'identity-bytes',
+            emitResponseEvent: {
+              statusCode: 200,
+              headers: {
+                'content-encoding': 'identity',
+                'content-length': '14',
+                etag: 'CKih16GjycICEAE=',
+              },
+            },
+          },
+        ],
+      ]);
+      const service = new GcsStorageService(testConfig, createMockStorage(files));
+      const testEnv = await startTestServer(service, (req, res, s) => {
+        const file = (req.url ?? '/').slice(1);
+        void s.streamFile(file, res, 'application/javascript; charset=utf-8', true, false);
+      });
+
+      try {
+        // Uppercase GZIP: SDK does not decompress, server forwards original headers and strong ETag
+        const upperRes = await executeRequest(testEnv.server, '/uppercase-gzip.js');
+        assert.equal(upperRes.statusCode, 200);
+        assert.equal(upperRes.headers['content-encoding'], 'GZIP');
+        assert.equal(upperRes.headers['content-length'], '14');
+        assert.equal(upperRes.headers.etag, '"CKih16GjycICEAE="');
+        assert.equal(upperRes.body, 'raw-gzip-bytes');
+
+        // Identity encoding: Content-Encoding is omitted, Content-Length and strong ETag preserved
+        const identityRes = await executeRequest(testEnv.server, '/identity.js');
+        assert.equal(identityRes.statusCode, 200);
+        assert.equal(identityRes.headers['content-encoding'], undefined);
+        assert.equal(identityRes.headers['content-length'], '14');
+        assert.equal(identityRes.headers.etag, '"CKih16GjycICEAE="');
+        assert.equal(identityRes.body, 'identity-bytes');
       } finally {
         await testEnv.close();
       }
@@ -993,7 +1052,9 @@ void describe('GCS Storage Service', () => {
         const response = await executeRequest(testEnv.server, '/main-5T7P2N6K.js', 'HEAD');
         assert.equal(response.statusCode, 200);
         assert.equal(response.headers['content-type'], 'application/javascript; charset=utf-8');
-        assert.notEqual(response.headers['content-length'], '60');
+        // Must NOT forward raw compressed content-length (60) or content-encoding per RFC 9110
+        assert.equal(response.headers['content-length'], undefined);
+        assert.equal(response.headers['content-encoding'], undefined);
         assert.equal(response.headers.etag, 'W/"CKih16GjycICEAE="');
         assert.equal(response.body, '');
       } finally {
@@ -1029,6 +1090,62 @@ void describe('GCS Storage Service', () => {
         assert.equal(response.headers['content-length'], '123');
         assert.equal(response.headers.etag, '"CKih16GjycICEAE="');
         assert.equal(response.body, '');
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should preserve Content-Encoding, Content-Length, and strong ETag for non-gzip encodings on HEAD while treating whitespace-padded gzip as gzip', async () => {
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/uppercase-gzip.js',
+          {
+            metadata: { size: 14, contentEncoding: 'GZIP', etag: 'CKih16GjycICEAE=' },
+          },
+        ],
+        [
+          'resume_cloudbuild/angular/whitespace-gzip.js',
+          {
+            metadata: { size: 14, contentEncoding: ' gzip ', etag: 'CKih16GjycICEAE=' },
+          },
+        ],
+        [
+          'resume_cloudbuild/angular/identity.js',
+          {
+            metadata: { size: 14, contentEncoding: 'identity', etag: 'CKih16GjycICEAE=' },
+          },
+        ],
+      ]);
+      const service = new GcsStorageService(testConfig, createMockStorage(files));
+      const testEnv = await startTestServer(service, (req, res, s) => {
+        const file = (req.url ?? '/').slice(1);
+        void s.streamFile(file, res, 'application/javascript; charset=utf-8', true, true);
+      });
+
+      try {
+        // Uppercase GZIP on HEAD: preserves Content-Encoding, Content-Length, and strong ETag
+        const upperRes = await executeRequest(testEnv.server, '/uppercase-gzip.js', 'HEAD');
+        assert.equal(upperRes.statusCode, 200);
+        assert.equal(upperRes.headers['content-encoding'], 'GZIP');
+        assert.equal(upperRes.headers['content-length'], '14');
+        assert.equal(upperRes.headers.etag, '"CKih16GjycICEAE="');
+        assert.equal(upperRes.body, '');
+
+        // Whitespace-padded gzip on HEAD: mirrors GET auto-decompression by omitting Content-Length & Content-Encoding and returning weak ETag
+        const wsRes = await executeRequest(testEnv.server, '/whitespace-gzip.js', 'HEAD');
+        assert.equal(wsRes.statusCode, 200);
+        assert.equal(wsRes.headers['content-encoding'], undefined);
+        assert.equal(wsRes.headers['content-length'], undefined);
+        assert.equal(wsRes.headers.etag, 'W/"CKih16GjycICEAE="');
+        assert.equal(wsRes.body, '');
+
+        // Identity on HEAD: omits Content-Encoding, preserves Content-Length and strong ETag
+        const identityRes = await executeRequest(testEnv.server, '/identity.js', 'HEAD');
+        assert.equal(identityRes.statusCode, 200);
+        assert.equal(identityRes.headers['content-encoding'], undefined);
+        assert.equal(identityRes.headers['content-length'], '14');
+        assert.equal(identityRes.headers.etag, '"CKih16GjycICEAE="');
+        assert.equal(identityRes.body, '');
       } finally {
         await testEnv.close();
       }
@@ -1483,10 +1600,91 @@ void describe('GCS Storage Service', () => {
         assert.equal(etagDecisions[0]?.choice, 'Strong ETag ("strong-styles-123")');
         assert.equal(
           etagDecisions[0]?.reason,
-          'GCS object is uncompressed or identity encoded, preserving strong validator and Content-Length (RFC 9110)',
+          'GCS object is not auto-decompressed by SDK (passthrough), preserving strong validator and Content-Length (RFC 9110)',
         );
         assert.equal(etagDecisions[0]?.level, 'debug');
         assert.equal(etagDecisions[0]?.isGzip, false);
+      } finally {
+        await testEnv.close();
+      }
+    });
+
+    void it('should log Strong ETag decisions for noncanonical gzip encodings (GZIP) and Weak ETag for trimmed whitespace gzip on HEAD', async () => {
+      const { logger, decisions } = createCapturingLogger();
+      const files = new Map<string, MockFileOptions>([
+        [
+          'resume_cloudbuild/angular/noncanonical.js',
+          {
+            content: 'bytes',
+            emitResponseEvent: {
+              statusCode: 200,
+              headers: {
+                'content-encoding': 'GZIP',
+                'content-length': '5',
+                etag: '"noncanonical-etag"',
+              },
+            },
+            metadata: {
+              contentEncoding: 'GZIP',
+              size: 5,
+              etag: '"noncanonical-etag"',
+            },
+          },
+        ],
+        [
+          'resume_cloudbuild/angular/whitespace.js',
+          {
+            metadata: {
+              contentEncoding: ' gzip ',
+              size: 5,
+              etag: '"whitespace-etag"',
+            },
+          },
+        ],
+      ]);
+
+      const service = new GcsStorageService({
+        config: testConfig,
+        storageClient: createMockStorage(files),
+        logger,
+      });
+
+      const testEnv = await startTestServer(service, (req, res, s) => {
+        const file = (req.url ?? '/').slice(1);
+        const isHead = req.method === 'HEAD';
+        void s.streamFile(file, res, 'application/javascript', false, isHead);
+      });
+
+      try {
+        await executeRequest(testEnv.server, '/noncanonical.js', 'GET');
+        await executeRequest(testEnv.server, '/noncanonical.js', 'HEAD');
+        await executeRequest(testEnv.server, '/whitespace.js', 'HEAD');
+
+        const etagDecisions = decisions.filter((d) => d.action === 'StorageEtag');
+        assert.equal(etagDecisions.length, 3);
+
+        // GET decision: noncanonical uppercase GZIP treated as passthrough strong ETag
+        assert.equal(etagDecisions[0]?.choice, 'Strong ETag ("noncanonical-etag")');
+        assert.equal(etagDecisions[0]?.isGzip, false);
+        assert.equal(etagDecisions[0]?.contentEncoding, 'GZIP');
+        assert.equal(
+          etagDecisions[0]?.reason,
+          'GCS object is not auto-decompressed by SDK (passthrough), preserving strong validator and Content-Length (RFC 9110)',
+        );
+
+        // HEAD decision: noncanonical uppercase GZIP treated as passthrough strong ETag
+        assert.equal(etagDecisions[1]?.choice, 'Strong ETag ("noncanonical-etag")');
+        assert.equal(etagDecisions[1]?.isGzip, false);
+        assert.equal(etagDecisions[1]?.contentEncoding, 'GZIP');
+        assert.equal(
+          etagDecisions[1]?.reason,
+          'GCS object is not auto-decompressed by SDK (passthrough), preserving strong validator and Content-Length (RFC 9110)',
+        );
+
+        // HEAD whitespace gzip decision: treated as gzip with weak ETag
+        assert.equal(etagDecisions[2]?.choice, 'Weak ETag (W/"whitespace-etag")');
+        assert.equal(etagDecisions[2]?.isGzip, true);
+        assert.equal(etagDecisions[2]?.omittedHeaders, 'Content-Length, Content-Encoding');
       } finally {
         await testEnv.close();
       }
@@ -2040,7 +2238,7 @@ void describe('GCS Storage Service', () => {
   });
 
   void describe('Storage contract regression', () => {
-    void it('should log StorageEtag gzip payloads with original keys and omit-headers choice', async () => {
+    void it('should log StorageEtag gzip payloads with original keys and omit-headers choice on GET and HEAD', async () => {
       const { logger, decisions } = createCapturingLogger();
       const files = new Map<string, MockFileOptions>([
         [
@@ -2060,35 +2258,49 @@ void describe('GCS Storage Service', () => {
         storageClient: createMockStorage(files),
         logger,
       });
-      const testEnv = await startTestServer(service, (_req, res, s) => {
-        void s.streamFile('gzip-no-etag.js', res, 'application/javascript', false, false);
+      const testEnv = await startTestServer(service, (req, res, s) => {
+        const isHead = req.method === 'HEAD';
+        void s.streamFile('gzip-no-etag.js', res, 'application/javascript', false, isHead);
       });
       try {
-        await executeRequest(testEnv.server, '/gzip-no-etag.js', 'GET');
+        const getRes = await executeRequest(testEnv.server, '/gzip-no-etag.js', 'GET');
+        assert.equal(getRes.statusCode, 200);
+        assert.equal(getRes.headers['content-length'], undefined);
+        assert.equal(getRes.headers['content-encoding'], undefined);
+        assert.equal(getRes.headers.etag, undefined);
+
+        const headRes = await executeRequest(testEnv.server, '/gzip-no-etag.js', 'HEAD');
+        assert.equal(headRes.statusCode, 200);
+        assert.equal(headRes.headers['content-length'], undefined);
+        assert.equal(headRes.headers['content-encoding'], undefined);
+        assert.equal(headRes.headers.etag, undefined);
+
         const etagDecisions = decisions.filter((d) => d.action === 'StorageEtag');
-        assert.equal(etagDecisions.length, 1);
-        assert.deepEqual(Object.keys(etagDecisions[0] ?? {}), [
-          'action',
-          'choice',
-          'reason',
-          'level',
-          'rawEtag',
-          'formattedEtag',
-          'contentEncoding',
-          'isGzip',
-          'path',
-          'omittedHeaders',
-        ]);
-        assert.equal(etagDecisions[0]?.choice, 'Omit Content-Length and Content-Encoding');
-        assert.equal(etagDecisions[0]?.formattedEtag, undefined);
-        assert.equal(etagDecisions[0]?.contentEncoding, 'gzip');
-        assert.equal(etagDecisions[0]?.path, 'resume_cloudbuild/angular/gzip-no-etag.js');
+        assert.equal(etagDecisions.length, 2);
+        for (const decision of etagDecisions) {
+          assert.deepEqual(Object.keys(decision ?? {}), [
+            'action',
+            'choice',
+            'reason',
+            'level',
+            'rawEtag',
+            'formattedEtag',
+            'contentEncoding',
+            'isGzip',
+            'path',
+            'omittedHeaders',
+          ]);
+          assert.equal(decision.choice, 'Omit Content-Length and Content-Encoding');
+          assert.equal(decision.formattedEtag, undefined);
+          assert.equal(decision.contentEncoding, 'gzip');
+          assert.equal(decision.path, 'resume_cloudbuild/angular/gzip-no-etag.js');
+        }
       } finally {
         await testEnv.close();
       }
     });
 
-    void it('should not log StorageEtag for non-gzip objects without an ETag', async () => {
+    void it('should not log StorageEtag for non-gzip objects without an ETag on GET and HEAD', async () => {
       const { logger, decisions } = createCapturingLogger();
       const files = new Map<string, MockFileOptions>([
         [
@@ -2105,11 +2317,21 @@ void describe('GCS Storage Service', () => {
         storageClient: createMockStorage(files),
         logger,
       });
-      const testEnv = await startTestServer(service, (_req, res, s) => {
-        void s.streamFile('plain-no-etag.js', res, 'application/javascript', false, false);
+      const testEnv = await startTestServer(service, (req, res, s) => {
+        const isHead = req.method === 'HEAD';
+        void s.streamFile('plain-no-etag.js', res, 'application/javascript', false, isHead);
       });
       try {
-        await executeRequest(testEnv.server, '/plain-no-etag.js', 'GET');
+        const getRes = await executeRequest(testEnv.server, '/plain-no-etag.js', 'GET');
+        assert.equal(getRes.statusCode, 200);
+        assert.equal(getRes.headers['content-length'], '5');
+        assert.equal(getRes.headers.etag, undefined);
+
+        const headRes = await executeRequest(testEnv.server, '/plain-no-etag.js', 'HEAD');
+        assert.equal(headRes.statusCode, 200);
+        assert.equal(headRes.headers['content-length'], '5');
+        assert.equal(headRes.headers.etag, undefined);
+
         assert.equal(decisions.filter((d) => d.action === 'StorageEtag').length, 0);
       } finally {
         await testEnv.close();

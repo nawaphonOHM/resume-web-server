@@ -18,7 +18,7 @@ const GZIP_REASON =
   'GCS object has gzip Content-Encoding and will be auto-decompressed on the fly (RFC 9110)';
 
 const STRONG_REASON =
-  'GCS object is uncompressed or identity encoded, preserving strong validator and Content-Length (RFC 9110)';
+  'GCS object is not auto-decompressed by SDK (passthrough), preserving strong validator and Content-Length (RFC 9110)';
 
 function gzipChoice(formattedEtag: string): string {
   if (formattedEtag !== '') return `Weak ETag (${formattedEtag})`;
@@ -66,6 +66,7 @@ function strongMeta(input: EtagDecisionInput): Record<string, unknown> {
   return {
     rawEtag: input.rawEtag,
     formattedEtag: input.formattedEtag,
+    contentEncoding: input.contentEncoding,
     isGzip: false,
     path: input.fullPath,
   };
