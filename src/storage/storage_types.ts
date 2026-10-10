@@ -110,6 +110,11 @@ export interface CandidateFileMatch {
    * Name of the first-level directory segment under prefix, or empty string if at root.
    */
   readonly directoryName: string;
+
+  /**
+   * Number of intermediate directory segments between deployment root and target match.
+   */
+  readonly extraSegments?: number;
 }
 
 /**
