@@ -99,6 +99,7 @@ void describe('MIME & Cache Utilities', () => {
       assert.equal(getMimeType('robots.txt'), 'text/plain; charset=utf-8');
       assert.equal(getMimeType('sitemap.xml'), 'application/xml; charset=utf-8');
       assert.equal(getMimeType('module.wasm'), 'application/wasm');
+      assert.equal(getMimeType('resume.pdf'), 'application/pdf');
     });
 
     void it('should handle uppercase file extensions', () => {
@@ -138,6 +139,7 @@ void describe('MIME & Cache Utilities', () => {
       assert.equal(isStaticAsset('/assets/icons/logo.svg'), true);
       assert.equal(isStaticAsset('/manifest.webmanifest'), true);
       assert.equal(isStaticAsset('/robots.txt'), true);
+      assert.equal(isStaticAsset('/resume.pdf'), true);
     });
 
     void it('should return false for SPA navigation routes without extensions', () => {
@@ -171,6 +173,7 @@ void describe('MIME & Cache Utilities', () => {
       assert.equal(isHashedAsset('main-5T7P2N6K.js.map'), true);
       assert.equal(isHashedAsset('styles-5INURTSO.css.map'), true);
       assert.equal(isHashedAsset('media/roboto-latin-400-6G54T7R3.woff2'), true);
+      assert.equal(isHashedAsset('resume-5T7P2N6K.pdf'), true);
     });
 
     void it('should return false for unhashed files and icons', () => {

@@ -35,6 +35,7 @@ export const MIME_TYPES: Readonly<Record<string, string>> = Object.freeze({
   '.txt': 'text/plain; charset=utf-8',
   '.xml': 'application/xml; charset=utf-8',
   '.wasm': 'application/wasm',
+  '.pdf': 'application/pdf',
 });
 
 /**
@@ -94,7 +95,7 @@ export const CACHE_CONTROL_NO_CACHE = 'public, max-age=0, must-revalidate';
  * web asset extension (with an optional trailing `.map` source map extension).
  */
 export const HASHED_ASSET_REGEX =
-  /-(?=[A-Za-z0-9_-]{8}\.(?:[a-z0-9]+\.)?[a-z0-9]+$)(?=[^.]*[0-9A-Z])[A-Za-z0-9_-]{8}\.(?:js|mjs|cjs|css|woff2?|ttf|otf|eot|svg|png|jpg|jpeg|webp|avif|ico|wasm)(?:\.map)?$/;
+  /-(?=[A-Za-z0-9_-]{8}\.(?:[a-z0-9]+\.)?[a-z0-9]+$)(?=[^.]*[0-9A-Z])[A-Za-z0-9_-]{8}\.(?:js|mjs|cjs|css|woff2?|ttf|otf|eot|svg|png|jpg|jpeg|webp|avif|ico|wasm|pdf)(?:\.map)?$/;
 
 /**
  * Contract for resolving MIME types from file paths (Interface Segregation Principle).

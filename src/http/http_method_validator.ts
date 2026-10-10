@@ -5,6 +5,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { isResponseWritable } from './http_response_state.ts';
 import { HTTP_STATUS_METHOD_NOT_ALLOWED } from './http_status_codes.ts';
 import type { AppLogger, DecisionLogPayload } from '../logger/logger_types.ts';
 import type { IHttpMethodValidator } from '../router/router_types.ts';
@@ -46,6 +47,7 @@ function makePermitPayload(method: string): DecisionLogPayload {
 }
 
 function write405Response(res: ServerResponse): void {
+  if (!isResponseWritable(res)) return;
   res.statusCode = HTTP_STATUS_METHOD_NOT_ALLOWED;
   res.setHeader('Allow', 'GET, HEAD');
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');

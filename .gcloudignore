@@ -2,7 +2,8 @@
 *
 
 # Allow compiled typescript (which is javascript)
-!dist/src
+!dist/
+!dist/**
 !package.json
 !package-lock.json
 !Procfile

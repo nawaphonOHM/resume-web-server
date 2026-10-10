@@ -5,7 +5,11 @@
  */
 
 import type { ServerResponse } from 'node:http';
-import { HTTP_STATUS_NOT_FOUND } from '../http/http_status_codes.ts';
+import { isResponseWritable } from '../http/http_response_state.ts';
+import {
+  HTTP_STATUS_INTERNAL_SERVER_ERROR,
+  HTTP_STATUS_NOT_FOUND,
+} from '../http/http_status_codes.ts';
 
 function clearStaleHeaders(res: ServerResponse): void {
   res.removeHeader('Content-Length');
@@ -15,11 +19,13 @@ function clearStaleHeaders(res: ServerResponse): void {
 }
 
 function getErrorBody(statusCode: number): string {
-  return statusCode === HTTP_STATUS_NOT_FOUND ? 'Not Found' : 'Bad Gateway';
+  if (statusCode === HTTP_STATUS_NOT_FOUND) return 'Not Found';
+  if (statusCode === HTTP_STATUS_INTERNAL_SERVER_ERROR) return 'Internal Server Error';
+  return 'Bad Gateway';
 }
 
 export function sendErrorPayload(res: ServerResponse, statusCode: number): void {
-  if (res.destroyed || res.writableEnded) return;
+  if (!isResponseWritable(res)) return;
   clearStaleHeaders(res);
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');

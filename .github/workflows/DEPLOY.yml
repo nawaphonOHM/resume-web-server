@@ -64,9 +64,6 @@ jobs:
       - name: Compile TypeScript
         run: npm run compile
 
-      - name: move Compiled TypeScript out One level
-        run: mv ./dist/* .
-
       - name: Submit Cloud Build
         env:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
