@@ -2573,6 +2573,29 @@ void describe('GCS Storage Service', () => {
         assert.equal(extractCandidateMatch(file2, 'resume', 'main.js'), null);
       });
 
+      void it('should match requested nested relative suffix and disambiguate identically named files in different subdirectories', () => {
+        const enFlag = createMockFile({}, 'resume/1712345678_v1/assets/en/flag.png');
+        const frFlag = createMockFile({}, 'resume/1712345678_v1/assets/fr/flag.png');
+
+        const enMatch = extractCandidateMatch(enFlag, 'resume', 'assets/en/flag.png');
+        assert.ok(enMatch);
+        assert.equal(enMatch.fullPath, 'resume/1712345678_v1/assets/en/flag.png');
+        assert.equal(enMatch.unixtime, 1712345678);
+
+        const frMatchAgainstEn = extractCandidateMatch(frFlag, 'resume', 'assets/en/flag.png');
+        assert.equal(frMatchAgainstEn, null);
+
+        const frMatch = extractCandidateMatch(frFlag, 'resume', 'assets/fr/flag.png');
+        assert.ok(frMatch);
+        assert.equal(frMatch.fullPath, 'resume/1712345678_v1/assets/fr/flag.png');
+
+        const nestedLogo = createMockFile({}, 'resume/1712345678_v1/nested/assets/logo.png');
+        assert.ok(extractCandidateMatch(nestedLogo, 'resume', 'assets/logo.png'));
+
+        const subassetsLogo = createMockFile({}, 'resume/1712345678_v1/subassets/logo.png');
+        assert.equal(extractCandidateMatch(subassetsLogo, 'resume', 'assets/logo.png'), null);
+      });
+
       void it('should enforce prefix boundary so other prefixes are excluded', () => {
         const file = createMockFile({}, 'resumextra/1712345678_v1/main.js');
         assert.equal(extractCandidateMatch(file, 'resume', 'main.js'), null);
@@ -2623,6 +2646,78 @@ void describe('GCS Storage Service', () => {
         assert.equal(list[0]?.fullPath, 'resume/1720000000_v2/a/main.js');
         assert.equal(list[1]?.fullPath, 'resume/1720000000_v2/b/main.js');
       });
+
+      void it('should prioritize exact relative path under deployment root over deeper path with extra directories', () => {
+        const exactLogo = extractCandidateMatch(
+          createMockFile({}, 'resume/1720000000_v2/assets/logo.png'),
+          'resume',
+          'assets/logo.png',
+        );
+        const deeperLogo = extractCandidateMatch(
+          createMockFile({}, 'resume/1720000000_v2/a/assets/logo.png'),
+          'resume',
+          'assets/logo.png',
+        );
+        assert.ok(exactLogo);
+        assert.ok(deeperLogo);
+        assert.equal(exactLogo.extraSegments, 0);
+        assert.equal(deeperLogo.extraSegments, 1);
+
+        const candidates = [deeperLogo, exactLogo];
+        candidates.sort(compareCandidates);
+        assert.equal(candidates[0].fullPath, 'resume/1720000000_v2/assets/logo.png');
+      });
+
+      void it('should prioritize root-level asset over nested asset when requested target is root basename', () => {
+        const rootLogo = extractCandidateMatch(
+          createMockFile({}, 'resume/1720000000_v2/logo.png'),
+          'resume',
+          'logo.png',
+        );
+        const nestedLogo = extractCandidateMatch(
+          createMockFile({}, 'resume/1720000000_v2/assets/logo.png'),
+          'resume',
+          'logo.png',
+        );
+        assert.ok(rootLogo);
+        assert.ok(nestedLogo);
+        assert.equal(rootLogo.extraSegments, 0);
+        assert.equal(nestedLogo.extraSegments, 1);
+
+        const candidates = [nestedLogo, rootLogo];
+        candidates.sort(compareCandidates);
+        assert.equal(candidates[0].fullPath, 'resume/1720000000_v2/logo.png');
+      });
+
+      void it('should prioritize newest timestamp even if older timestamp has shallower depth', () => {
+        const newerDeeper = extractCandidateMatch(
+          createMockFile({}, 'resume/1725000000_v3/nested/deep/assets/logo.png'),
+          'resume',
+          'assets/logo.png',
+        );
+        const olderExact = extractCandidateMatch(
+          createMockFile({}, 'resume/1720000000_v2/assets/logo.png'),
+          'resume',
+          'assets/logo.png',
+        );
+        assert.ok(newerDeeper);
+        assert.ok(olderExact);
+
+        const candidates = [olderExact, newerDeeper];
+        candidates.sort(compareCandidates);
+        assert.equal(candidates[0].fullPath, 'resume/1725000000_v3/nested/deep/assets/logo.png');
+      });
+
+      void it('should resolve fallback-only dist/main.js when no root copy exists', () => {
+        const distMain = extractCandidateMatch(
+          createMockFile({}, 'resume/1720000000_v2/dist/main.js'),
+          'resume',
+          'main.js',
+        );
+        assert.ok(distMain);
+        assert.equal(distMain.extraSegments, 1);
+        assert.equal(distMain.fullPath, 'resume/1720000000_v2/dist/main.js');
+      });
     });
 
     describe('StorageObjectLocator direct and recursive search execution', () => {
@@ -2672,6 +2767,80 @@ void describe('GCS Storage Service', () => {
         assert.equal(res.strategy, 'recursive');
         assert.equal(res.fullPath, 'app/1725000000_build/nested/deep/bundle.css');
         assert.equal(res.unixtime, 1725000000);
+      });
+
+      void it('should correctly disambiguate identically named assets in different subdirectories during recursive fallback', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1720000000_v2/assets/en/flag.png', { content: 'en-flag' }],
+          ['app/1720000000_v2/assets/fr/flag.png', { content: 'fr-flag' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+
+        const enRes = await locator.locateFile(storage.bucket('b'), 'assets/en/flag.png', 'app');
+        assert.ok(enRes);
+        assert.equal(enRes.strategy, 'recursive');
+        assert.equal(enRes.fullPath, 'app/1720000000_v2/assets/en/flag.png');
+
+        const frRes = await locator.locateFile(storage.bucket('b'), 'assets/fr/flag.png', 'app');
+        assert.ok(frRes);
+        assert.equal(frRes.strategy, 'recursive');
+        assert.equal(frRes.fullPath, 'app/1720000000_v2/assets/fr/flag.png');
+      });
+
+      void it('should return exact relative path match when deployment directory contains both exact and deeper duplicate candidates', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1720000000_v2/assets/logo.png', { content: 'exact-logo' }],
+          ['app/1720000000_v2/a/assets/logo.png', { content: 'deeper-logo' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+
+        const res = await locator.locateFile(storage.bucket('b'), 'assets/logo.png', 'app');
+        assert.ok(res);
+        assert.equal(res.strategy, 'recursive');
+        assert.equal(res.fullPath, 'app/1720000000_v2/assets/logo.png');
+      });
+
+      void it('should return root-level asset when deployment contains both root and nested candidate for requested root path', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1720000000_v2/logo.png', { content: 'root-logo' }],
+          ['app/1720000000_v2/assets/logo.png', { content: 'nested-logo' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+
+        const res = await locator.locateFile(storage.bucket('b'), 'logo.png', 'app');
+        assert.ok(res);
+        assert.equal(res.strategy, 'recursive');
+        assert.equal(res.fullPath, 'app/1720000000_v2/logo.png');
+      });
+
+      void it('should return root copy over dist copy when both exist in same deployment directory', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1720000000_v2/main.js', { content: 'root-main' }],
+          ['app/1720000000_v2/dist/main.js', { content: 'dist-main' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+
+        const res = await locator.locateFile(storage.bucket('b'), 'main.js', 'app');
+        assert.ok(res);
+        assert.equal(res.strategy, 'recursive');
+        assert.equal(res.fullPath, 'app/1720000000_v2/main.js');
+      });
+
+      void it('should resolve fallback-only dist/main.js when no root copy exists in deployment directory', async () => {
+        const files = new Map<string, MockFileOptions>([
+          ['app/1720000000_v2/dist/main.js', { content: 'dist-main-only' }],
+        ]);
+        const storage = createMockStorage(files);
+        const locator = new StorageObjectLocator();
+
+        const res = await locator.locateFile(storage.bucket('b'), 'main.js', 'app');
+        assert.ok(res);
+        assert.equal(res.strategy, 'recursive');
+        assert.equal(res.fullPath, 'app/1720000000_v2/dist/main.js');
       });
 
       void it('should return null when object is not found directly or recursively', async () => {

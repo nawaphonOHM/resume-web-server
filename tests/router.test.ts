@@ -417,6 +417,58 @@ void describe('HTTP Router & Request Handler', () => {
         valid: true,
         path: '/media/font-6G54T7R3.woff2',
       });
+      assert.deepEqual(validateAndSanitizePath('/assets/images/photo.webp'), {
+        valid: true,
+        path: '/assets/images/photo.webp',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/images/photo.avif'), {
+        valid: true,
+        path: '/assets/images/photo.avif',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/fonts/font.woff'), {
+        valid: true,
+        path: '/assets/fonts/font.woff',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/fonts/font.ttf'), {
+        valid: true,
+        path: '/assets/fonts/font.ttf',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/fonts/font.otf'), {
+        valid: true,
+        path: '/assets/fonts/font.otf',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/fonts/font.eot'), {
+        valid: true,
+        path: '/assets/fonts/font.eot',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/wasm/module.wasm'), {
+        valid: true,
+        path: '/assets/wasm/module.wasm',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/sitemap.xml'), {
+        valid: true,
+        path: '/assets/sitemap.xml',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/config.json'), {
+        valid: true,
+        path: '/assets/config.json',
+      });
+      assert.deepEqual(validateAndSanitizePath('/dist/bundle.mjs'), {
+        valid: true,
+        path: '/dist/bundle.mjs',
+      });
+      assert.deepEqual(validateAndSanitizePath('/dist/bundle.cjs'), {
+        valid: true,
+        path: '/dist/bundle.cjs',
+      });
+      assert.deepEqual(validateAndSanitizePath('/dist/main.js.map'), {
+        valid: true,
+        path: '/dist/main.js.map',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/icons/favicon.ico'), {
+        valid: true,
+        path: '/assets/icons/favicon.ico',
+      });
     });
 
     void it('should reject disallowed file extensions for single-level and nested paths', () => {
@@ -619,6 +671,8 @@ void describe('HTTP Router & Request Handler', () => {
     void it('should reject directory traversal sequences before and after normalization', () => {
       assert.equal(validateAndSanitizePath('/../etc/passwd').valid, false);
       assert.equal(validateAndSanitizePath('/assets/../main.js').valid, false);
+      assert.equal(validateAndSanitizePath('/assets/sub/../../etc/passwd').valid, false);
+      assert.equal(validateAndSanitizePath('/media/../font.woff2').valid, false);
       assert.equal(validateAndSanitizePath('/..').valid, false);
       assert.equal(validateAndSanitizePath('/%2e%2e/etc/passwd').valid, false);
       assert.equal(validateAndSanitizePath('/%2E%2E/secret').valid, false);
@@ -626,6 +680,8 @@ void describe('HTTP Router & Request Handler', () => {
       assert.equal(validateAndSanitizePath('/.%2e/secret').valid, false);
       assert.equal(validateAndSanitizePath('/.%2E/secret').valid, false);
       assert.equal(validateAndSanitizePath('/%2E./secret').valid, false);
+      assert.equal(validateAndSanitizePath('/assets/%2e%2e/secret.png').valid, false);
+      assert.equal(validateAndSanitizePath('/nested/%2E%2E/styles.css').valid, false);
     });
 
     void it('should reject malformed percent encodings', () => {
@@ -876,6 +932,51 @@ void describe('HTTP Router & Request Handler', () => {
         contentType: 'text/css; charset=utf-8',
         isHashed: true,
         isHead: true,
+      });
+
+      // Nested unhashed static asset
+      await router.handle({ method: 'GET', url: '/assets/logo.png' } as IncomingMessage, dummyRes);
+      assert.deepEqual(streamCalls[3], {
+        objectName: 'assets/logo.png',
+        contentType: 'image/png',
+        isHashed: false,
+        isHead: false,
+      });
+
+      // Nested hashed JS bundle
+      await router.handle(
+        { method: 'GET', url: '/dist/browser/main-5T7P2N6K.js' } as IncomingMessage,
+        dummyRes,
+      );
+      assert.deepEqual(streamCalls[4], {
+        objectName: 'dist/browser/main-5T7P2N6K.js',
+        contentType: 'application/javascript; charset=utf-8',
+        isHashed: true,
+        isHead: false,
+      });
+
+      // Nested hashed font (HEAD)
+      await router.handle(
+        { method: 'HEAD', url: '/media/font-6G54T7R3.woff2' } as IncomingMessage,
+        dummyRes,
+      );
+      assert.deepEqual(streamCalls[5], {
+        objectName: 'media/font-6G54T7R3.woff2',
+        contentType: 'font/woff2',
+        isHashed: true,
+        isHead: true,
+      });
+
+      // Nested hashed CSS
+      await router.handle(
+        { method: 'GET', url: '/nested/deep/styles-5INURTSO.css' } as IncomingMessage,
+        dummyRes,
+      );
+      assert.deepEqual(streamCalls[6], {
+        objectName: 'nested/deep/styles-5INURTSO.css',
+        contentType: 'text/css; charset=utf-8',
+        isHashed: true,
+        isHead: false,
       });
     });
 
@@ -2711,6 +2812,73 @@ void describe('HTTP Router & Request Handler', () => {
           metadata: { etag: 'etag-logo-png' },
         },
       ],
+      // Nested assets in subdirectories (including same basename across subdirectories)
+      [
+        'resume_cloudbuild/angular/1725000000_rel/assets/i18n/en/flag.png',
+        {
+          content: 'en-flag-png',
+          metadata: { etag: 'etag-i18n-en' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1725000000_rel/assets/i18n/fr/flag.png',
+        {
+          content: 'fr-flag-png',
+          metadata: { etag: 'etag-i18n-fr' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1725000000_rel/media/fonts/font-6G54T7R3.woff2',
+        {
+          content: 'binary-font-woff2',
+          metadata: { etag: 'etag-font-woff2' },
+        },
+      ],
+      // Same-deployment exact vs deeper duplicates
+      [
+        'resume_cloudbuild/angular/1725000000_rel/assets/brand/badge.png',
+        {
+          content: 'exact-brand-badge',
+          metadata: { etag: 'etag-exact-brand-badge' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1725000000_rel/a/assets/brand/badge.png',
+        {
+          content: 'deeper-brand-badge',
+          metadata: { etag: 'etag-deeper-brand-badge' },
+        },
+      ],
+      // Same-deployment root vs nested duplicate
+      [
+        'resume_cloudbuild/angular/1725000000_rel/favicon.ico',
+        {
+          content: 'root-favicon-data',
+          metadata: { etag: 'etag-root-favicon' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1725000000_rel/assets/favicon.ico',
+        {
+          content: 'nested-assets-favicon-data',
+          metadata: { etag: 'etag-nested-assets-favicon' },
+        },
+      ],
+      // Same-deployment root override vs dist copy
+      [
+        'resume_cloudbuild/angular/1720000000_v2/runtime-config.js',
+        {
+          content: 'console.log("v2-root-runtime-config");',
+          metadata: { etag: 'etag-root-runtime-config' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/1720000000_v2/dist/runtime-config.js',
+        {
+          content: 'console.log("v2-dist-runtime-config");',
+          metadata: { etag: 'etag-dist-runtime-config' },
+        },
+      ],
       // Non-timestamped / unversioned directory mixed with timestamped
       [
         'resume_cloudbuild/angular/unversioned_backup/common.js',
@@ -2842,6 +3010,93 @@ void describe('HTTP Router & Request Handler', () => {
       assert.equal(imgRes.headers.etag, '"etag-logo-png"');
       assert.equal(imgRes.headers['content-length'], '16');
       assert.equal(imgRes.body, 'binary-logo-data');
+    });
+
+    void it('should serve nested static assets with 200 OK and correct MIME types and disambiguate identically named assets in subdirectories over real HTTP', async () => {
+      // 1. Nested unhashed PNG asset: /assets/i18n/en/flag.png
+      const enRes = await performHttpRequest(multiVersionPort, {
+        path: '/assets/i18n/en/flag.png',
+      });
+      assert.equal(enRes.statusCode, 200);
+      assert.equal(enRes.headers['content-type'], 'image/png');
+      assert.equal(enRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+      assert.equal(enRes.headers.etag, '"etag-i18n-en"');
+      assert.equal(enRes.headers['content-length'], '11');
+      assert.equal(enRes.body, 'en-flag-png');
+
+      // 2. Disambiguated nested unhashed PNG asset with same basename: /assets/i18n/fr/flag.png
+      const frRes = await performHttpRequest(multiVersionPort, {
+        path: '/assets/i18n/fr/flag.png',
+      });
+      assert.equal(frRes.statusCode, 200);
+      assert.equal(frRes.headers['content-type'], 'image/png');
+      assert.equal(frRes.headers['cache-control'], 'public, max-age=0, must-revalidate');
+      assert.equal(frRes.headers.etag, '"etag-i18n-fr"');
+      assert.equal(frRes.headers['content-length'], '11');
+      assert.equal(frRes.body, 'fr-flag-png');
+
+      // 3. Nested hashed font asset: /media/fonts/font-6G54T7R3.woff2
+      const fontRes = await performHttpRequest(multiVersionPort, {
+        path: '/media/fonts/font-6G54T7R3.woff2',
+      });
+      assert.equal(fontRes.statusCode, 200);
+      assert.equal(fontRes.headers['content-type'], 'font/woff2');
+      assert.equal(fontRes.headers['cache-control'], 'public, max-age=31536000, immutable');
+      assert.equal(fontRes.headers.etag, '"etag-font-woff2"');
+      assert.equal(fontRes.headers['content-length'], '17');
+      assert.equal(fontRes.body, 'binary-font-woff2');
+
+      // 4. Nested hashed font asset HEAD: /media/fonts/font-6G54T7R3.woff2
+      const headFontRes = await performHttpRequest(multiVersionPort, {
+        path: '/media/fonts/font-6G54T7R3.woff2',
+        method: 'HEAD',
+      });
+      assert.equal(headFontRes.statusCode, 200);
+      assert.equal(headFontRes.headers['content-type'], 'font/woff2');
+      assert.equal(headFontRes.headers['cache-control'], 'public, max-age=31536000, immutable');
+      assert.equal(headFontRes.headers.etag, '"etag-font-woff2"');
+      assert.equal(headFontRes.headers['content-length'], '17');
+      assert.equal(headFontRes.body, '');
+    });
+
+    void it('should prioritize exact relative path over deeper path duplicate in same deployment over HTTP', async () => {
+      // /assets/brand/badge.png matches both 1725000000_rel/assets/brand/badge.png and 1725000000_rel/a/assets/brand/badge.png
+      const res = await performHttpRequest(multiVersionPort, {
+        path: '/assets/brand/badge.png',
+      });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers['content-type'], 'image/png');
+      assert.equal(res.headers.etag, '"etag-exact-brand-badge"');
+      assert.equal(res.body, 'exact-brand-badge');
+    });
+
+    void it('should prioritize root asset over nested duplicate when root asset is requested over HTTP', async () => {
+      // /favicon.ico matches both 1725000000_rel/favicon.ico and 1725000000_rel/assets/favicon.ico
+      const res = await performHttpRequest(multiVersionPort, {
+        path: '/favicon.ico',
+      });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers['content-type'], 'image/x-icon');
+      assert.equal(res.headers.etag, '"etag-root-favicon"');
+      assert.equal(res.body, 'root-favicon-data');
+    });
+
+    void it('should prioritize root copy over dist copy in same deployment and resolve fallback-only dist/main.js over HTTP', async () => {
+      // /runtime-config.js matches both 1720000000_v2/runtime-config.js and 1720000000_v2/dist/runtime-config.js
+      const rootOverrideRes = await performHttpRequest(multiVersionPort, {
+        path: '/runtime-config.js',
+      });
+      assert.equal(rootOverrideRes.statusCode, 200);
+      assert.equal(rootOverrideRes.headers.etag, '"etag-root-runtime-config"');
+      assert.equal(rootOverrideRes.body, 'console.log("v2-root-runtime-config");');
+
+      // /main.js only exists in dist/browser/main.js in 1720000000_v2 -> resolves correctly
+      const mainRes = await performHttpRequest(multiVersionPort, {
+        path: '/main.js',
+      });
+      assert.equal(mainRes.statusCode, 200);
+      assert.equal(mainRes.headers.etag, '"etag-v2-main"');
+      assert.equal(mainRes.body, 'console.log("v2-main");');
     });
 
     void it('should prioritize timestamped deployments over unversioned directories, but fallback to unversioned when no timestamped match exists', async () => {
