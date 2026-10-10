@@ -52,13 +52,13 @@ Incoming requests traverse a deterministic 7-step pipeline designed for high thr
 
 ### 5. Multi-Layer Path Traversal Protection
 
-The `DefenseInDepthPathSanitizer` guards against path manipulation and directory traversal attacks via a 13-point inspection routine:
+The `DefenseInDepthPathSanitizer` guards against path manipulation and directory traversal attacks via a 12-point inspection routine:
 
 - Rejects null bytes (`\0`, `%00`), backslashes (`\`, `%5C`), and encoded forward slashes (`%2F`).
 - Catches double-encoded traversal sequences (e.g. `%252e`, `%255c`, `%252f`).
 - Enforces POSIX normalization and traps directory escape sequences (`../`, `/..`).
-- Validates file extensions against a strict allowlist of recognized web MIME types (single-level files with unsupported extensions like `/x.env` or `/config.env` are rejected, whereas dotfiles like `/.env` and nested unknown extensions proceed to SPA fallback).
-- Disallows static file extensions on nested sub-paths (only allowed at root level or routed via SPA fallback).
+- Validates file extensions against a strict allowlist of recognized web MIME types across both single-level and nested paths (unsupported extensions like `.exe`, `.php`, `/x.env`, or `/assets/secret.php` are rejected with `400 Bad Request`, whereas dotfiles like `/.env` and extensionless paths proceed to SPA fallback).
+- Supports nested static asset paths required by modern SPA build setups (e.g., `/assets/styles.css`, `/media/font.woff2`, `/dist/browser/main.js`).
 - Disallowed or malformed paths immediately receive `400 Bad Request`.
 
 ### 6. Standard Security Headers
@@ -194,7 +194,7 @@ The server exposes three primary request paths: health telemetry, static asset s
 ### 2. Static Asset Streaming (`GET /<asset-path>`)
 
 - **Path Classification**: Requests with recognized non-HTML file extensions (e.g. `.js`, `.css`, `.png`, `.svg`, `.woff2`, `.json`, `.ico`, `.wasm`).
-- **Single-Level Path Constraint**: Static asset requests must target a single-level path parameter (`/{pathParam}`). Nested paths targeting static extensions (e.g. `/assets/logo.png` or `/nested/style.css`) are rejected by the path sanitizer with `400 Bad Request` (`"Static asset requests must target a single-level path parameter"`).
+- **Nested & Single-Level Asset Support**: Static asset requests target either root-level or nested paths with supported file extensions (e.g. `/main.js`, `/assets/logo.png`, `/dist/browser/app.js`, `/media/font-6G54T7R3.woff2`).
 - **MIME Type Resolution**: Maps file extensions against `MIME_TYPES` (supporting 26 web extensions: 24 static asset extensions in `KNOWN_STATIC_EXTENSIONS` plus 2 HTML document extensions in `KNOWN_HTML_EXTENSIONS`), falling back to `application/octet-stream`.
 - **Caching Directives**:
   - **Content-Hashed Assets**: Bundles matching `HASHED_ASSET_REGEX` (e.g. `main-5T7P2N6K.js`, `styles-5INURTSO.css`) receive `Cache-Control: public, max-age=31536000, immutable`.
@@ -208,7 +208,7 @@ The server exposes three primary request paths: health telemetry, static asset s
 
 ### 3. SPA Client-Side Routing Fallback (`GET /<route>`)
 
-- **Path Classification**: Extensionless paths (e.g. `/`, `/experience`, `/projects`, `/skills/angular`), standalone dotfiles (e.g. `/.env`), nested navigation paths (including unknown nested extensions like `/user/profile.data`), and HTML documents (`.html`, `.htm`).
+- **Path Classification**: Extensionless paths (e.g. `/`, `/experience`, `/projects`, `/skills/angular`), standalone dotfiles (e.g. `/.env`), nested extensionless navigation paths (including paths with dotted intermediate directory segments like `/v1.2/overview`), and HTML documents (`.html`, `.htm`).
 - **Behavior**: Directs the request to `index.html` from the GCS bucket to serve the SPA shell.
 - **Headers**:
   - `Content-Type: text/html; charset=utf-8`
@@ -247,7 +247,7 @@ Referrer-Policy: strict-origin-when-cross-origin
 
 ### Defense-in-Depth Path Traversal Sanitizer
 
-The `DefenseInDepthPathSanitizer` enforces a 13-stage validation routine:
+The `DefenseInDepthPathSanitizer` enforces a 12-stage validation routine:
 
 1. **Presence Check**: Rejects `undefined`, empty, or whitespace-only URLs (`400 Bad Request`).
 2. **Decomposition**: Strips scheme and host (`http://`, `https://`), query strings (`?...`), and fragment identifiers (`#...`).
@@ -259,9 +259,8 @@ The `DefenseInDepthPathSanitizer` enforces a 13-stage validation routine:
 8. **URI Decoding**: Safely executes `decodeURIComponent` with error trapping for malformed percent sequences.
 9. **Decoded Character Check**: Re-evaluates decoded strings for hidden null bytes, backslashes, and traversal sequences.
 10. **POSIX Normalization**: Normalizes path via `posix.normalize` and verifies that the normalized path does not escape the virtual root directory.
-11. **Single-Level Static Constraint**: Enforces that static asset requests target single-level root files (e.g. `/main.js`), blocking nested directory requests (`/assets/main.js`).
-12. **Extension Allowlist**: Rejects unsupported single-level file extensions (e.g. `.exe`, `.php`, `/x.env` or `/config.env`, `.tar.gz`, `.sh`, `.bin`). Note that standalone dotfiles (e.g. `/.env`) have an empty extension in Node.js path resolution and proceed to SPA fallback.
-13. **SPA Path Preservation**: Safely permits multi-level extensionless paths (`/user/profile`), unknown nested extensions (`/user/profile.data`, `/user/john.doe`), and HTML extensions (`/docs/guide.htm`) for SPA routing.
+11. **Nested Static Asset Support & Extension Allowlist**: Enforces the file extension allowlist across all single-level and nested paths, rejecting disallowed file extensions (e.g. `.exe`, `.php`, `/x.env`, `/assets/secret.php`, `.tar.gz`, `.sh`, `.bin`). Standalone dotfiles (e.g. `/.env`) have an empty extension in Node.js path resolution and proceed to SPA fallback.
+12. **SPA Path Preservation**: Safely permits multi-level extensionless paths (`/user/profile`), paths with dotted intermediate directory segments (`/v1.2/overview`), and HTML extensions (`/docs/guide.htm`) for SPA routing.
 
 ---
 

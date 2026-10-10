@@ -388,20 +388,48 @@ void describe('HTTP Router & Request Handler', () => {
       });
     });
 
-    void it('should reject nested static asset paths', () => {
-      assert.equal(validateAndSanitizePath('/assets/logo.png').valid, false);
-      assert.equal(validateAndSanitizePath('/nested/styles.css').valid, false);
-      assert.equal(validateAndSanitizePath('/dist/browser/main.js').valid, false);
-      assert.equal(validateAndSanitizePath('/a/b/c/bundle.js').valid, false);
-      assert.equal(validateAndSanitizePath('/assets/sub/icon.svg').valid, false);
-      assert.equal(validateAndSanitizePath('/.well-known/security.txt').valid, false);
-      assert.equal(validateAndSanitizePath('/media/font-6G54T7R3.woff2').valid, false);
+    void it('should accept valid nested static asset paths with supported extensions', () => {
+      assert.deepEqual(validateAndSanitizePath('/assets/logo.png'), {
+        valid: true,
+        path: '/assets/logo.png',
+      });
+      assert.deepEqual(validateAndSanitizePath('/nested/styles.css'), {
+        valid: true,
+        path: '/nested/styles.css',
+      });
+      assert.deepEqual(validateAndSanitizePath('/dist/browser/main.js'), {
+        valid: true,
+        path: '/dist/browser/main.js',
+      });
+      assert.deepEqual(validateAndSanitizePath('/a/b/c/bundle.js'), {
+        valid: true,
+        path: '/a/b/c/bundle.js',
+      });
+      assert.deepEqual(validateAndSanitizePath('/assets/sub/icon.svg'), {
+        valid: true,
+        path: '/assets/sub/icon.svg',
+      });
+      assert.deepEqual(validateAndSanitizePath('/.well-known/security.txt'), {
+        valid: true,
+        path: '/.well-known/security.txt',
+      });
+      assert.deepEqual(validateAndSanitizePath('/media/font-6G54T7R3.woff2'), {
+        valid: true,
+        path: '/media/font-6G54T7R3.woff2',
+      });
     });
 
-    void it('should reject disallowed file extensions for single-level paths', () => {
+    void it('should reject disallowed file extensions for single-level and nested paths', () => {
       assert.equal(validateAndSanitizePath('/app.exe').valid, false);
       assert.equal(validateAndSanitizePath('/secret.php').valid, false);
+      assert.equal(validateAndSanitizePath('/assets/secret.php').valid, false);
+      assert.equal(validateAndSanitizePath('/user/john.doe').valid, false);
+      assert.equal(validateAndSanitizePath('/user/profile.data').valid, false);
+      assert.equal(validateAndSanitizePath('/blog/post.1').valid, false);
+      assert.equal(validateAndSanitizePath('/profile/a@b.com').valid, false);
+      assert.equal(validateAndSanitizePath('/nested/malicious.exe').valid, false);
       assert.equal(validateAndSanitizePath('/config.env').valid, false);
+      assert.equal(validateAndSanitizePath('/sub/config.env').valid, false);
       assert.equal(validateAndSanitizePath('/backup.tar.gz').valid, false);
       assert.equal(validateAndSanitizePath('/script.sh').valid, false);
       assert.equal(validateAndSanitizePath('/test.py').valid, false);
@@ -486,18 +514,18 @@ void describe('HTTP Router & Request Handler', () => {
       });
     });
 
-    void it('should preserve dotted multi-level SPA navigation routes and dotfile directory paths', () => {
-      assert.deepEqual(validateAndSanitizePath('/user/john.doe'), {
-        valid: true,
-        path: '/user/john.doe',
-      });
-      assert.deepEqual(validateAndSanitizePath('/blog/post.1'), {
-        valid: true,
-        path: '/blog/post.1',
-      });
+    void it('should preserve multi-level SPA navigation routes with dotted intermediate directory segments and dotfiles', () => {
       assert.deepEqual(validateAndSanitizePath('/v1.2/overview'), {
         valid: true,
         path: '/v1.2/overview',
+      });
+      assert.deepEqual(validateAndSanitizePath('/dashboard/v2.0/settings'), {
+        valid: true,
+        path: '/dashboard/v2.0/settings',
+      });
+      assert.deepEqual(validateAndSanitizePath('/release-1.0/overview'), {
+        valid: true,
+        path: '/release-1.0/overview',
       });
       assert.deepEqual(validateAndSanitizePath('/.git/config'), {
         valid: true,
@@ -1010,6 +1038,55 @@ void describe('HTTP Router & Request Handler', () => {
           metadata: { etag: '"favicon-etag-1"' },
         },
       ],
+      [
+        'resume_cloudbuild/angular/assets/logo.png',
+        {
+          content: 'png-image-bytes',
+          metadata: { etag: '"logo-etag-1"' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/dist/browser/main.js',
+        {
+          content: 'console.log("nested bundle");',
+          metadata: { etag: '"nested-js-etag-1"' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/sub/styles.css',
+        {
+          content: 'h1 { color: red; }',
+          metadata: { etag: '"sub-styles-etag-1"' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/nested/deep/icon.svg',
+        {
+          content: '<svg></svg>',
+          metadata: { etag: '"icon-svg-etag-1"' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/static/manifest.json',
+        {
+          content: '{"name":"app"}',
+          metadata: { etag: '"manifest-etag-1"' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/.well-known/security.txt',
+        {
+          content: 'Contact: security@example.com',
+          metadata: { etag: '"sec-txt-etag-1"' },
+        },
+      ],
+      [
+        'resume_cloudbuild/angular/media/font-6G54T7R3.woff2',
+        {
+          content: 'woff2-font-bytes',
+          metadata: { etag: '"font-woff2-etag-1"' },
+        },
+      ],
     ]);
 
     const mockStorage = createMockStorage(files);
@@ -1107,6 +1184,14 @@ void describe('HTTP Router & Request Handler', () => {
           '/assets%2f../secret.js',
           '/assets%5csecret.js',
           '/%00secret.js',
+          '/nested/../../secret.js',
+          '/assets/%2e%2e/secret.js',
+          '/assets/..%2fsecret.js',
+          '/assets/../main.js',
+          '/dist/%252e%252e/main.js',
+          '/%00/assets/logo.png',
+          '/assets/%5clogo.png',
+          '/assets/logo.png%00',
         ];
 
         for (const path of attackPaths) {
@@ -1578,32 +1663,57 @@ void describe('HTTP Router & Request Handler', () => {
       }
     });
 
-    void it('should reject nested static asset paths with 400 Bad Request in real HTTP server', async () => {
+    void it('should successfully route and stream nested static asset paths in real HTTP server', async () => {
       await startServer();
       try {
-        const nestedPaths = [
-          '/assets/logo.png',
-          '/dist/browser/main.js',
-          '/sub/styles.css',
-          '/nested/deep/icon.svg',
-          '/static/manifest.json',
-          '/.well-known/security.txt',
+        const testCases = [
+          { path: '/assets/logo.png', contentType: 'image/png', body: 'png-image-bytes' },
+          {
+            path: '/dist/browser/main.js',
+            contentType: 'application/javascript; charset=utf-8',
+            body: 'console.log("nested bundle");',
+          },
+          {
+            path: '/sub/styles.css',
+            contentType: 'text/css; charset=utf-8',
+            body: 'h1 { color: red; }',
+          },
+          {
+            path: '/nested/deep/icon.svg',
+            contentType: 'image/svg+xml',
+            body: '<svg></svg>',
+          },
+          {
+            path: '/static/manifest.json',
+            contentType: 'application/json; charset=utf-8',
+            body: '{"name":"app"}',
+          },
+          {
+            path: '/.well-known/security.txt',
+            contentType: 'text/plain; charset=utf-8',
+            body: 'Contact: security@example.com',
+          },
+          {
+            path: '/media/font-6G54T7R3.woff2',
+            contentType: 'font/woff2',
+            body: 'woff2-font-bytes',
+          },
         ];
-        for (const nestedPath of nestedPaths) {
-          const res = await performHttpRequest(serverPort, { path: nestedPath });
-          assert.equal(res.statusCode, 400, `Expected 400 for nested static path ${nestedPath}`);
-          assert.equal(res.headers['content-type'], 'text/plain; charset=utf-8');
+        for (const tc of testCases) {
+          const res = await performHttpRequest(serverPort, { path: tc.path });
+          assert.equal(res.statusCode, 200, `Expected 200 for nested static path ${tc.path}`);
+          assert.equal(res.headers['content-type'], tc.contentType);
           assert.equal(res.headers['x-content-type-options'], 'nosniff');
           assert.equal(res.headers['x-frame-options'], 'SAMEORIGIN');
           assert.equal(res.headers['referrer-policy'], 'strict-origin-when-cross-origin');
-          assert.equal(res.body, 'Bad Request');
+          assert.equal(res.body, tc.body);
         }
       } finally {
         await stopServer();
       }
     });
 
-    void it('should successfully serve /health, root /, and SPA routes with nested HTML / dotted paths in real HTTP server', async () => {
+    void it('should successfully serve /health, root /, and SPA routes with nested HTML / dotted intermediate segments in real HTTP server', async () => {
       await startServer();
       try {
         // 1. Health check endpoint
@@ -1633,8 +1743,12 @@ void describe('HTTP Router & Request Handler', () => {
           assert.ok(res.body.includes('<title>Resume</title>'));
         }
 
-        // 4. Dotted SPA navigation routes
-        const dottedPaths = ['/user/john.doe', '/blog/post.1', '/v1.2/overview'];
+        // 4. SPA navigation routes with dotted intermediate directory segments
+        const dottedPaths = [
+          '/v1.2/overview',
+          '/dashboard/v2.0/settings',
+          '/release-1.0/overview',
+        ];
         for (const dottedPath of dottedPaths) {
           const res = await performHttpRequest(serverPort, { path: dottedPath });
           assert.equal(res.statusCode, 200, `Expected 200 for dotted SPA route ${dottedPath}`);
@@ -1667,6 +1781,13 @@ void describe('HTTP Router & Request Handler', () => {
         const disallowedPaths = [
           '/malicious.exe',
           '/secret.php',
+          '/assets/secret.php',
+          '/user/john.doe',
+          '/user/profile.data',
+          '/blog/post.1',
+          '/profile/a@b.com',
+          '/sub/malicious.exe',
+          '/nested/config.env',
           '/config.env',
           '/backup.tar.gz',
           '/script.sh',

@@ -28,8 +28,8 @@ function onInvalidPath(
 }
 
 /**
- * Validates the incoming request URL, enforces single-level path parameters for static assets,
- * checks allowed extensions via the configured path sanitizer, and returns the cleaned path.
+ * Validates the incoming request URL against traversal and extension allowlists
+ * via the configured path sanitizer, and returns the cleaned path.
  *
  * @param deps - Resolved router dependencies including path sanitizer and logger.
  * @param req - Incoming HTTP request message.
